@@ -1,259 +1,598 @@
+import asyncio
 import os
-import requests # requests는 pyproject.toml에 추가했으므로 사용 가능
-import subprocess
-import google.generativeai as genai
-# config 모듈 import
-import config # 설정 파일 import
+import sys
+import json
+import traceback
+from typing import Optional, List, Dict, Any, Tuple
+from contextlib import AsyncExitStack
 
-# Google AI 설정 (config.py 에서 로드)
+# MCP 관련 import
+from mcp import ClientSession, StdioServerParameters, types as mcp_types
+from mcp.client.stdio import stdio_client
+
+# 다른 전송 방식 클라이언트 임포트 (필요시)
+from mcp.client.sse import sse_client
+
+# from mcp.client.websocket import websocket_client
+
+# Google Gemini 관련 import (기존 코드 유지)
+import google.generativeai as genai
+from google.generativeai.types import GenerationConfig, Tool, FunctionDeclaration
+
+# .env 파일 로드 (기존 코드 유지)
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- Google AI 설정 (기존 코드 유지) ---
 try:
-    # API 키 존재 및 기본값 여부 확인
-    if not hasattr(config, 'GOOGLE_API_KEY') or not config.GOOGLE_API_KEY or config.GOOGLE_API_KEY == "YOUR_API_KEY_HERE":
-        print("오류: config.py 파일에 GOOGLE_API_KEY가 설정되지 않았거나 유효하지 않습니다.")
-        print("config.py 파일을 열어 API 키를 올바르게 입력해주세요.")
-        exit(1)
-    genai.configure(api_key=config.GOOGLE_API_KEY)
-except AttributeError:
-    print("오류: config.py 파일에서 GOOGLE_API_KEY 변수를 찾을 수 없습니다.")
-    exit(1)
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+    if not google_api_key:
+        raise ValueError(
+            "환경 변수 'GOOGLE_API_KEY'가 설정되지 않았습니다. .env 파일을 확인하세요."
+        )
+    genai.configure(api_key=google_api_key)
+except ValueError as e:
+    print(f"오류: {e}")
+    sys.exit(1)
 except Exception as e:
     print(f"Google AI 설정 중 오류 발생: {e}")
-    exit(1)
-
-# 사용할 모델 설정 (config.py 에서 로드)
-try:
-    # 모델 이름과 안전 설정 존재 여부 확인
-    if not hasattr(config, 'MODEL_NAME') or not hasattr(config, 'SAFETY_SETTINGS'):
-         raise AttributeError("config.py에 MODEL_NAME 또는 SAFETY_SETTINGS가 정의되지 않았습니다.")
-    model = genai.GenerativeModel(config.MODEL_NAME, safety_settings=config.SAFETY_SETTINGS)
-except AttributeError as e:
-     print(f"오류: {e}")
-     exit(1)
-except Exception as e:
-    print(f"AI 모델 로드 중 오류 발생: {e}")
-    exit(1)
+    sys.exit(1)
 
 
-# 시스템 프롬프트 (AI에게 역할과 제약 조건 부여)
-# 이전 버전과 동일하게 유지 (내용 생략 - 실제 코드에는 포함됨)
-SYSTEM_PROMPT = """
-You are an AI agent designed to assist the user by performing tasks on their computer. You achieve this by interpreting the user's natural language requests and generating a single, appropriate terminal command that the user's local application will then execute on your behalf. You use the terminal as a tool to access and manipulate computer resources (files, folders, processes, etc.). Your primary operating environment is macOS.
+# --- MCP 클라이언트 클래스 (수정) ---
+class MultiMCPClient:  # 클래스 이름 변경 (여러 서버 관리)
+    def __init__(self):
+        # 여러 세션을 관리하기 위한 딕셔너리
+        self.sessions: Dict[str, ClientSession] = {}
+        self.exit_stack = AsyncExitStack()
+        self.all_mcp_tools: List[mcp_types.Tool] = []  # 모든 서버의 도구 통합
+        self.tool_to_server_map: Dict[str, str] = {}  # 도구 이름 -> 서버 이름 매핑
 
-**Your Goal:**
-Understand the user's intent and generate the single best terminal command to fulfill that intent in a safe manner.
-
-**Absolute Safety Directives (Non-negotiable):**
-1.  **PRIORITY 1: SAFETY.** NEVER generate commands that could harm the user's system, compromise data, or violate privacy.
-2.  **FORBIDDEN ACTIONS:** You are strictly prohibited from generating commands that:
-    * Modify or delete system files or directories (e.g., anything under `/`, `/etc`, `/usr`, `/System` - listing these is generally acceptable, but modification/deletion is not).
-    * Modify network configurations.
-    * Modify user accounts or permissions.
-    * Attempt to gain elevated privileges (e.g., commands involving `sudo` or `pkexec`).
-    * Perform recursive destructive operations without very specific, limited, and pre-defined targets (e.g., be extremely cautious with `rm -rf`).
-    * Download and execute arbitrary external files.
-3.  You are an agent suggesting actions via commands; the user's application will validate and confirm execution. Do not attempt to simulate execution or describe results you haven't confirmed via a real terminal output (which you cannot directly access).
-
-**Interpreting User Requests (as an Agent):**
-- Analyze the user's request to understand the underlying task or goal (e.g., "find a file", "organize downloads", "get system info").
-- Determine if this task can be accomplished safely and effectively with a *single* terminal command on macOS.
-
-**Output Format (Strict Requirements for App Processing):**
-Your response MUST be formatted using one of the following structures ONLY:
-
-1.  **Task Action Proposed (Command Generated):**
-    If you successfully determine a safe and appropriate single command to perform the user's requested task, output:
-    ```
-    <CMD>
-    [Generated Terminal Command String]
-    </CMD>
-    <CMD_EXPLANATION>
-    [사용자의 요청을 처리하기 위해 이 명령어를 선택한 이유와 이 명령어가 수행할 작업을 한국어로 설명합니다.]
-    </CMD_EXPLANATION>
-    ```
-    * `[Generated Terminal Command String]`: The exact, executable command for macOS (e.g., `ls -l`, `cd Documents`, `mkdir new_folder`). Do NOT include conversational text or markdown formatting outside the `<CMD>` tags for the command itself. The command string must be parsable by the application.
-    * `[사용자의 요청을 처리하기 위해...]`: A clear, concise explanation in Korean of *what the command does* and *why you chose it* based on the user's request. This helps the user understand and confirm.
-
-2.  **Clarification Needed (Cannot Proceed):**
-    If the user's request is unclear, ambiguous, or requires more information for you to determine a specific action or command, output:
-    ```
-    <CLARIFICATION>
-    [에이전트로서 작업을 수행하기 위해 어떤 정보가 더 필요한지 사용자에게 구체적이고 친절하게 한국어로 질문합니다. 예: "어떤 파일에 대해 작업할까요?", "이 작업을 수행할 폴더는 어디인가요?"]
-    </CLARIFICATION>
-    ```
-    * `[에이전트로서 작업을 수행하기 위해...]`: A specific question or statement requesting necessary information in Korean.
-
-3.  **Task Cannot Be Fulfilled (Error / Unsafe / Beyond Capability):**
-    If the user's request is impossible, beyond your current capability as an agent using single terminal commands, requires multiple complex steps, or violates the absolute safety directives, output:
-    ```
-    <ERROR>
-    [요청을 에이전트로서 처리할 수 없는 이유를 한국어로 명확하고 안전하게 설명합니다. 보안 정책 위반인 경우 그 점을 명시하세요. 예: "죄송합니다. 해당 작업은 보안상 위험하여 수행할 수 없습니다.", "이 작업은 여러 단계를 거쳐야 하거나 제가 단일 명령어로 수행할 수 있는 범위를 넘어섭니다.", "요청 내용을 이해했지만, 현재 기능으로는 수행하기 어렵습니다."]
-    </ERROR>
-    ```
-    * `[요청을 에이전트로서 처리할 수 없는 이유를...]`: A clear explanation in Korean of *why* the task cannot be done by the agent via a single command, mentioning safety or capability limits if applicable.
-
-**General Agent Behavior:**
-- Be task-oriented. Focus on understanding the user's goal.
-- Prioritize safety above all else. When in doubt, output `<ERROR>`.
-- Generate only one command per request if a command is possible.
-- All explanatory text, questions, and error messages must be in Korean. The command string itself must be the standard terminal syntax.
-- Do not include any conversational filler before or after the defined tags.
-
-**Now, process the user's request provided in the next input.**
-"""
-
-def get_ai_command(user_prompt):
-    """
-    사용자 프롬프트를 받아 AI 모델에게 적절한 터미널 명령어를 생성하도록 요청합니다.
-    """
-    try:
-        # 시스템 프롬프트와 사용자 프롬프트를 결합하여 전달
-        full_prompt = f"{SYSTEM_PROMPT}\n\nUser Request: {user_prompt}"
-        response = model.generate_content(full_prompt)
-
-        # 응답 텍스트 추출 및 후처리 (앞뒤 공백 제거)
-        ai_response_text = response.text.strip()
-        return ai_response_text
-
-    except Exception as e:
-        print(f"AI 명령어 생성 중 오류 발생: {e}")
-        # 오류 발생 시 <ERROR> 태그를 포함한 메시지 반환
-        return f"<ERROR>\nAI 모델 호출 중 오류가 발생했습니다: {e}\n</ERROR>"
-
-
-def execute_command(command):
-    """
-    주어진 터미널 명령어를 실행하고 결과를 반환합니다.
-    보안상 위험할 수 있으므로 주의해서 사용해야 합니다.
-    """
-    print(f"\n[명령어 실행 시도]: {command}")
-    command_timeout = 30 # 기본 타임아웃 값
-    try:
-        # config 파일에서 타임아웃 값 읽기 시도
-        if hasattr(config, 'COMMAND_TIMEOUT') and isinstance(config.COMMAND_TIMEOUT, (int, float)) and config.COMMAND_TIMEOUT > 0:
-            command_timeout = config.COMMAND_TIMEOUT
-        else:
-            print("[경고]: config.py의 COMMAND_TIMEOUT이 유효하지 않거나 없습니다. 기본값 30초를 사용합니다.")
-
-        # shell=True는 보안 위험을 증가시킬 수 있으므로 신중하게 사용
-        # 여기서는 AI가 생성한 단일 명령어를 실행하기 위해 사용
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            check=False, # check=True로 하면 오류 발생 시 예외 발생
-            timeout=command_timeout # 설정된 타임아웃 사용
+        # Google Gemini 모델 초기화 (기존과 유사)
+        self.gemini_model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash-preview-04-17",
+            # safety_settings=...
+            # generation_config=...
         )
-        print("--- 실행 결과 ---")
-        if result.stdout:
-            print("[STDOUT]:")
-            print(result.stdout)
-        if result.stderr:
-            print("[STDERR]:")
-            print(result.stderr)
-        print(f"[Return Code]: {result.returncode}")
-        print("-----------------")
-        return result.stdout, result.stderr, result.returncode
-    except subprocess.TimeoutExpired:
-        print(f"[오류]: 명령어 실행 시간이 초과되었습니다 ({command_timeout}초).")
-        return None, f"TimeoutExpired: 명령어 실행 시간이 초과되었습니다 ({command_timeout}초).", -1 # 타임아웃 시 특별한 리턴 코드
-    except Exception as e:
-        print(f"[오류]: 명령어 실행 중 예외 발생: {e}")
-        return None, f"Exception: {e}", -1 # 일반 예외 시 특별한 리턴 코드
+        self.chat_session = self.gemini_model.start_chat(
+            enable_automatic_function_calling=True
+        )
 
-def parse_ai_response(ai_response):
-    """
-    AI 응답에서 <CMD>, <CMD_EXPLANATION>, <CLARIFICATION>, <ERROR> 태그를 파싱합니다.
-    """
-    command = None
-    explanation = None
-    clarification = None
-    error = None
-
-    # 태그 파싱 로직 (이전 버전과 동일)
-    if "<CMD>" in ai_response and "</CMD>" in ai_response:
-        start_cmd = ai_response.find("<CMD>") + len("<CMD>")
-        end_cmd = ai_response.find("</CMD>")
-        command = ai_response[start_cmd:end_cmd].strip()
-
-        if "<CMD_EXPLANATION>" in ai_response and "</CMD_EXPLANATION>" in ai_response:
-            start_exp = ai_response.find("<CMD_EXPLANATION>") + len("<CMD_EXPLANATION>")
-            end_exp = ai_response.find("</CMD_EXPLANATION>")
-            explanation = ai_response[start_exp:end_exp].strip()
-        else:
-            explanation = "(설명 없음)" # 설명 태그가 없는 경우
-
-    elif "<CLARIFICATION>" in ai_response and "</CLARIFICATION>" in ai_response:
-        start_clar = ai_response.find("<CLARIFICATION>") + len("<CLARIFICATION>")
-        end_clar = ai_response.find("</CLARIFICATION>")
-        clarification = ai_response[start_clar:end_clar].strip()
-
-    elif "<ERROR>" in ai_response and "</ERROR>" in ai_response:
-        start_err = ai_response.find("<ERROR>") + len("<ERROR>")
-        end_err = ai_response.find("</ERROR>")
-        error = ai_response[start_err:end_err].strip()
-    else:
-        # 예상치 못한 형식의 응답 처리
-        error = f"AI 응답 형식이 올바르지 않습니다:\n{ai_response}"
-
-
-    return command, explanation, clarification, error
-
-
-def main():
-    """
-    메인 애플리케이션 로직
-    """
-    print("로컬 에이전트 앱 (종료하려면 'exit' 입력)")
-
-    while True:
-        try:
-            user_input = input("\n요청사항을 입력하세요: ")
-            if user_input.lower() == 'exit':
-                print("앱을 종료합니다.")
-                break
-            if not user_input:
-                continue
-
-            print("\nAI에게 명령어 생성을 요청합니다...")
-            ai_response = get_ai_command(user_input)
-
-            print("\n--- AI 응답 ---")
-            print(ai_response)
-            print("---------------")
-
-            command, explanation, clarification, error = parse_ai_response(ai_response)
-
-            if command:
-                print(f"\n[AI 제안 명령어]: {command}")
-                print(f"[설명]: {explanation}")
-                # 사용자 확인 절차 (보안 강화)
-                confirm = input("이 명령어를 실행하시겠습니까? (y/n): ").lower()
-                if confirm == 'y':
-                    execute_command(command)
-                else:
-                    print("명령어 실행이 취소되었습니다.")
-            elif clarification:
-                print(f"\n[AI 요청]: {clarification}")
-                # 사용자가 다음 입력에서 추가 정보 제공
-            elif error:
-                print(f"\n[AI 오류]: {error}")
+    # MultiMCPClient 클래스 내부에 추가될 헬퍼 함수
+    def _clean_schema_for_gemini(
+        self, schema: Optional[Dict[str, Any]], tool_name: str, path: str = "root"
+    ) -> Optional[Dict[str, Any]]:
+        """Gemini FunctionDeclaration 스키마에 맞게 불필요한 필드를 제거하는 재귀 함수"""
+        if not isinstance(schema, dict):
+            # inputSchema 자체가 없거나 dict가 아니면 None 반환 (parameters 없이 생성 시도)
+            if path == "root":
+                print(
+                    f"경고 [{tool_name}]: inputSchema가 없거나 딕셔너리가 아닙니다. parameters 없이 도구를 정의합니다."
+                )
             else:
-                # 파싱 실패 또는 예상치 못한 응답
-                 print("\n[오류]: AI로부터 유효한 응답을 받지 못했습니다.")
+                print(
+                    f"경고 [{tool_name}]: 스키마 경로 '{path}'의 값이 딕셔너리가 아닙니다: {schema}. 이 부분을 제외합니다."
+                )
+            return None
 
+        cleaned_schema = {}
+        ALLOWED_FIELDS = {
+            "type",
+            "description",
+            "properties",
+            "required",
+            "enum",
+            "items",
+        }
+        VALID_JSON_SCHEMA_TYPES = {
+            "string",
+            "number",
+            "integer",
+            "boolean",
+            "array",
+            "object",
+        }
 
-        except EOFError:
-            print("\n입력 스트림이 닫혔습니다. 앱을 종료합니다.")
-            break
-        except KeyboardInterrupt:
-            print("\nCtrl+C 입력 감지. 앱을 종료합니다.")
-            break
+        # 1. type 검증 및 설정 (필수)
+        schema_type = schema.get("type")
+        if isinstance(schema_type, str) and schema_type in VALID_JSON_SCHEMA_TYPES:
+            cleaned_schema["type"] = schema_type
+        else:
+            # 타입이 없거나 유효하지 않으면 기본값 'object' 또는 'string' 추론
+            default_type = "object" if "properties" in schema else "string"
+            print(
+                f"경고 [{tool_name}]: 스키마 경로 '{path}'의 type ('{schema_type}')이 유효하지 않습니다. 기본값 '{default_type}'를 사용합니다."
+            )
+            cleaned_schema["type"] = default_type
+
+        # 2. description 설정 (선택)
+        description = schema.get("description")
+        if description is not None:
+            cleaned_schema["description"] = (
+                str(description) if not isinstance(description, str) else description
+            )
+
+        # 3. enum 설정 (선택, type이 string/number/integer일 때 유효)
+        enum_values = schema.get("enum")
+        current_type = cleaned_schema.get("type")
+        if isinstance(enum_values, list) and current_type in [
+            "string",
+            "number",
+            "integer",
+        ]:
+            # 모든 요소가 해당 타입인지 확인 (여기서는 간단히 문자열/숫자만 허용)
+            valid_enum = [
+                val for val in enum_values if isinstance(val, (str, int, float, bool))
+            ]  # bool 추가
+            if valid_enum:
+                cleaned_schema["enum"] = valid_enum
+            else:
+                print(
+                    f"경고 [{tool_name}]: 스키마 경로 '{path}'의 enum 값들이 유효하지 않습니다: {enum_values}"
+                )
+
+        # 4. properties 처리 (type이 'object'일 때)
+        if current_type == "object":
+            properties = schema.get("properties")
+            if isinstance(properties, dict):
+                cleaned_properties = {}
+                for prop_name, prop_schema in properties.items():
+                    # 재귀 호출로 하위 속성 스키마 정리
+                    cleaned_prop = self._clean_schema_for_gemini(
+                        prop_schema, tool_name, f"{path}.properties.{prop_name}"
+                    )
+                    if cleaned_prop:  # 유효한 스키마만 추가
+                        cleaned_properties[prop_name] = cleaned_prop
+                if cleaned_properties:  # 빈 properties는 추가하지 않음
+                    cleaned_schema["properties"] = cleaned_properties
+
+            # 5. required 처리 (type이 'object'이고 properties가 있을 때)
+            if "properties" in cleaned_schema:  # 정리된 properties가 있어야 함
+                required = schema.get("required")
+                if isinstance(required, list):
+                    # required 항목이 문자열이고 cleaned_properties에 존재하는지 확인
+                    valid_required = [
+                        req
+                        for req in required
+                        if isinstance(req, str) and req in cleaned_schema["properties"]
+                    ]
+                    if valid_required:  # 빈 required는 추가하지 않음
+                        cleaned_schema["required"] = valid_required
+
+        # 6. items 처리 (type이 'array'일 때)
+        elif current_type == "array":
+            items_schema = schema.get("items")
+            # 재귀 호출로 배열 항목 스키마 정리
+            cleaned_items = self._clean_schema_for_gemini(
+                items_schema, tool_name, f"{path}.items"
+            )
+            if cleaned_items:  # 유효한 스키마만 추가
+                cleaned_schema["items"] = cleaned_items
+            else:
+                print(
+                    f"경고 [{tool_name}]: 스키마 경로 '{path}' (배열 타입)에 유효한 'items' 정의가 없습니다."
+                )
+
+        # 최종적으로 유효한 키가 하나라도 있는지 확인 (최소 type은 있어야 함)
+        return cleaned_schema if cleaned_schema else None  # 완전히 비면 None 반환
+
+    def _mcp_tools_to_gemini_tools(self) -> List[Tool]:
+        """
+        통합된 MCP 도구 목록을 Gemini Tool 객체 리스트로 변환합니다.
+        MCP Tool의 name, description을 사용하고,
+        inputSchema를 Gemini FunctionDeclaration의 parameters로 변환합니다.
+        이때 Gemini 스키마에서 지원하지 않는 필드는 제거합니다.
+        """
+        gemini_function_declarations: List[FunctionDeclaration] = []
+        processed_tool_names = set()
+
+        for tool in self.all_mcp_tools:
+            if tool.name in processed_tool_names:
+                print(
+                    f"경고: 중복된 도구 이름 '{tool.name}' 발견. 첫 번째 도구만 사용합니다."
+                )
+                continue
+            processed_tool_names.add(tool.name)
+
+            try:
+                # MCP inputSchema를 Gemini 호환 스키마로 정리
+                cleaned_parameters = self._clean_schema_for_gemini(
+                    tool.inputSchema, tool.name
+                )
+
+                # print(f"--- 최종 Gemini Parameters for {tool.name} ---")
+                # print(json.dumps(cleaned_parameters, indent=2))
+                # print("-" * 30)
+
+                # FunctionDeclaration 생성 시도
+                func_decl = FunctionDeclaration(
+                    name=tool.name,
+                    description=(
+                        str(tool.description)
+                        if not isinstance(tool.description, str)
+                        else tool.description
+                    ),
+                    # cleaned_parameters가 None이거나 비어있으면 parameters 자체를 전달하지 않음
+                    parameters=cleaned_parameters if cleaned_parameters else None,
+                )
+                gemini_function_declarations.append(func_decl)
+            except Exception as e:
+                # FunctionDeclaration 생성 시 여전히 오류가 발생할 수 있음
+                print(f"오류: 도구 '{tool.name}'의 FunctionDeclaration 생성 실패 - {e}")
+                # 실패 시 사용된 파라미터 로깅 (cleaned_parameters가 정의되었는지 확인)
+                params_for_log = (
+                    cleaned_parameters
+                    if "cleaned_parameters" in locals()
+                    else tool.inputSchema
+                )
+                print(
+                    f"도구 이름: '{tool.name}'\n도구 설명: '{tool.description}'\n사용된 parameters: {json.dumps(params_for_log, indent=2)}"
+                )
+
+        return (
+            [Tool(function_declarations=gemini_function_declarations)]
+            if gemini_function_declarations
+            else []
+        )
+
+    async def _connect_and_init_stdio(self, server_name: str, config: Dict[str, Any]):
+        """지정된 stdio 서버에 연결하고 초기화하는 내부 함수"""
+        command = config.get("command")
+        args = config.get("args", [])
+        env = config.get("env", os.environ.copy())  # 없으면 현재 환경 사용
+        if not command:
+            print(
+                f"경고: 서버 '{server_name}' 설정에 'command'가 없어 건너<0xEB><0x9C><0x9C>니다."
+            )
+            return
+
+        server_params = StdioServerParameters(command=command, args=args, env=env)
+        try:
+            print(f"'{server_name}' (stdio) 연결 시도: {command} {' '.join(args)}")
+            # enter_async_context를 사용하여 exit_stack으로 관리
+            stdio_transport = await self.exit_stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            read_stream, write_stream = stdio_transport
+            session = await self.exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+
+            await session.initialize()
+            print(f"✅ '{server_name}' 세션 초기화 완료.")
+            self.sessions[server_name] = session
+
+            # 이 서버의 도구 가져오기
+            list_tools_result = await session.list_tools()
+            server_tools = list_tools_result.tools if list_tools_result else []
+            print(f"  '{server_name}' 제공 도구: {[t.name for t in server_tools]}")
+            self.all_mcp_tools.extend(server_tools)
+            for tool in server_tools:
+                if tool.name in self.tool_to_server_map:
+                    print(
+                        f"경고: 도구 이름 '{tool.name}'이(가) '{self.tool_to_server_map[tool.name]}' 서버와 '{server_name}' 서버에 중복됩니다. '{server_name}'의 도구를 사용합니다."
+                    )
+                self.tool_to_server_map[tool.name] = server_name  # 도구 <-> 서버 매핑
+
+            # --- 스키마 로깅 시작 ---
+            # print(f"--- [스키마 로그] '{server_name}' 서버 도구 상세 정보 ---")
+            # if server_tools:
+            #     for tool in server_tools:
+            #         print(f"  도구 이름: {tool.name}")
+            #         print(f"  설명: {tool.description}")
+            #         print(f"  Input 스키마 (inputSchema):")
+            #         try:
+            #             # inputSchema를 보기 좋게 JSON 문자열로 변환하여 출력
+            #             schema_str = json.dumps(
+            #                 tool.inputSchema, indent=4, ensure_ascii=False
+            #             )
+            #             print(schema_str)
+            #         except Exception as e:
+            #             # JSON 변환 중 오류 발생 시 원본 데이터 출력
+            #             print(f"    (스키마 JSON 변환 오류: {e})")
+            #             print(f"    Raw Schema: {tool.inputSchema}")
+            #         print("-" * 30)
+            # else:
+            #     print("  (이 서버에서 제공하는 도구가 없습니다)")
+            # print(f"--- [스키마 로그] '{server_name}' 서버 정보 출력 완료 ---")
+            # --- 스키마 로깅 끝 ---
+
         except Exception as e:
-            print(f"\n예상치 못한 오류 발생: {e}")
-            # 오류 발생 시에도 계속 실행되도록 루프 유지 (선택 사항)
-            # break # 또는 루프 종료
+            print(f"❌ '{server_name}' 서버 연결 또는 초기화 실패: {e}")
+            # 연결 실패 시 해당 세션은 self.sessions에 추가되지 않음
+
+    # --- SSE/WebSocket 연결 함수 (필요시 추가) ---
+    async def _connect_and_init_sse(self, server_name: str, config: Dict[str, Any]):
+        """지정된 SSE 서버에 연결하고 초기화하는 내부 함수"""
+        url = config.get("url")
+        headers = config.get("headers")  # 인증 등
+        if not url:
+            print(
+                f"경고: SSE 서버 '{server_name}' 설정에 'url'이 없어 건너<0xEB><0x9C><0x9C>니다."
+            )
+            return
+        try:
+            print(f"'{server_name}' (SSE) 연결 시도: {url}")
+            sse_transport = await self.exit_stack.enter_async_context(
+                sse_client(url=url, headers=headers)
+            )
+            read_stream, write_stream = sse_transport
+            session = await self.exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+            await session.initialize()
+            print(f"✅ '{server_name}' (SSE) 세션 초기화 완료.")
+            self.sessions[server_name] = session
+            # 도구 가져오기 및 매핑 (stdio와 동일 로직)
+            list_tools_result = await session.list_tools()
+            server_tools = list_tools_result.tools if list_tools_result else []
+            print(f"  '{server_name}' 제공 도구: {[t.name for t in server_tools]}")
+            self.all_mcp_tools.extend(server_tools)
+            for tool in server_tools:
+                if tool.name in self.tool_to_server_map:
+                    print(
+                        f"경고: 도구 이름 '{tool.name}' 중복. '{server_name}'의 도구를 사용합니다."
+                    )
+                self.tool_to_server_map[tool.name] = server_name
+        except Exception as e:
+            print(f"❌ '{server_name}' (SSE) 서버 연결 또는 초기화 실패: {e}")
+
+    async def connect_all_servers(self, server_configs: Dict[str, Dict[str, Any]]):
+        """설정 파일에 정의된 모든 서버에 병렬로 연결합니다."""
+        tasks = []
+        for server_name, config in server_configs.items():
+            transport_type = config.get("transport", "stdio").lower()  # 기본값 stdio
+
+            if transport_type == "stdio":
+                # command 필드가 있는지 확인 (stdio 필수)
+                if "command" in config:
+                    tasks.append(self._connect_and_init_stdio(server_name, config))
+                else:
+                    print(
+                        f"경고: stdio 서버 '{server_name}' 설정에 'command'가 없어 건너<0xEB><0x9C><0x9C>니다."
+                    )
+            elif transport_type == "sse":
+                # url 필드가 있는지 확인 (sse 필수)
+                if "url" in config:
+                    tasks.append(self._connect_and_init_sse(server_name, config))
+                else:
+                    print(
+                        f"경고: SSE 서버 '{server_name}' 설정에 'url'이 없어 건너<0xEB><0x9C><0x9C>니다."
+                    )
+            # TODO: WebSocket 등 다른 전송 방식 지원 추가
+            else:
+                print(
+                    f"경고: 지원되지 않는 전송 방식 '{transport_type}' (서버: {server_name}). 건너<0xEB><0x9C><0x9C>니다."
+                )
+
+        await asyncio.gather(*tasks)  # 모든 연결 시도를 병렬로 실행
+        print(
+            f"\n총 {len(self.sessions)}개의 서버에 성공적으로 연결 및 초기화되었습니다."
+        )
+        print(
+            f"사용 가능한 전체 MCP 도구: {[tool.name for tool in self.all_mcp_tools]}"
+        )
+
+    async def process_query(self, query: str) -> str:
+        """사용자 쿼리를 처리하고, 필요시 올바른 MCP 서버의 도구를 호출합니다."""
+        if not self.sessions:
+            return "오류: 연결된 MCP 서버가 없습니다."
+
+        print("\nGemini 모델에게 요청 전송 중...")
+        gemini_tools = self._mcp_tools_to_gemini_tools()
+        print(
+            f"[DEBUG] Gemini에게 전달될 도구 정보: {len(gemini_tools[0].function_declarations) if gemini_tools else 0}개"
+        )
+
+        try:
+            response = await self.chat_session.send_message_async(
+                query, tools=gemini_tools
+            )
+
+            final_text_parts = []
+            while True:
+                if not response.candidates:
+                    print("경고: Gemini로부터 응답 후보를 받지 못했습니다.")
+                    break
+
+                # 수정: parts 접근 전에 content 존재 여부 확인
+                candidate_content = response.candidates[0].content
+                if not candidate_content or not candidate_content.parts:
+                    print("경고: Gemini 응답에 내용(content or parts)이 없습니다.")
+                    if final_text_parts:
+                        break
+                    else:
+                        return "오류: AI로부터 유효한 응답을 받지 못했습니다."
+
+                latest_response_part = candidate_content.parts[0]
+
+                if latest_response_part.text:
+                    final_text_parts.append(latest_response_part.text)
+                    break
+
+                elif (
+                    hasattr(latest_response_part, "function_call")
+                    and latest_response_part.function_call
+                ):
+                    function_call = latest_response_part.function_call
+                    tool_name = function_call.name
+
+                    # Gemini가 호출하려는 도구가 어떤 서버에 속하는지 확인
+                    target_server_name = self.tool_to_server_map.get(tool_name)
+                    if not target_server_name:
+                        print(
+                            f"❌ 오류: Gemini가 알 수 없는 도구 '{tool_name}' 호출을 시도했습니다."
+                        )
+                        final_text_parts.append(
+                            f"[오류: 알 수 없는 도구 '{tool_name}']"
+                        )
+                        break  # 오류 발생 시 중단
+
+                    target_session = self.sessions.get(target_server_name)
+                    if not target_session:
+                        print(
+                            f"❌ 오류: 도구 '{tool_name}'을 처리할 서버 '{target_server_name}'의 세션을 찾을 수 없습니다."
+                        )
+                        final_text_parts.append(f"[오류: 도구 '{tool_name}' 처리 실패]")
+                        break  # 오류 발생 시 중단
+
+                    # 인자 파싱 (기존 코드 유지)
+                    tool_args_dict = {}
+                    if hasattr(function_call, "args") and function_call.args:
+                        try:
+                            tool_args_dict = {
+                                key: value for key, value in function_call.args.items()
+                            }
+                        except Exception as e:
+                            print(
+                                f"경고: Gemini 함수 호출 인자 파싱 중 오류: {e}. 빈 인자로 시도합니다."
+                            )
+                            tool_args_dict = {}
+
+                    print(
+                        f"[Gemini 요청: 서버 '{target_server_name}'의 MCP 도구 '{tool_name}' 호출 (인자: {tool_args_dict})]"
+                    )
+                    final_text_parts.append(
+                        f"[도구 호출: {tool_name}({json.dumps(tool_args_dict, ensure_ascii=False)})]"
+                    )
+
+                    # 해당 서버의 세션을 사용하여 MCP 도구 호출
+                    try:
+                        # ★★★★★ 핵심: 올바른 세션으로 도구 호출 ★★★★★
+                        mcp_result = await target_session.call_tool(
+                            tool_name, arguments=tool_args_dict
+                        )
+                        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+
+                        # 결과 처리 (기존 코드 유지, 오류 발생 시 tool_result에 반영되도록 수정 필요)
+                        result_content = "[Tool executed successfully]"  # 기본 메시지
+                        if mcp_result.isError:
+                            result_content = f"[오류: 도구 '{tool_name}' 실행 실패]"
+                            print(f"MCP 도구 '{tool_name}' 실행 오류 보고됨.")
+                        elif mcp_result.content:
+                            # 간단히 첫 번째 텍스트 콘텐츠 사용 (실제로는 더 복잡한 처리 필요)
+                            if isinstance(mcp_result.content[0], mcp_types.TextContent):
+                                result_content = mcp_result.content[0].text
+                                print(
+                                    f"[MCP 도구 '{tool_name}' 결과]: {result_content[:200]}..."
+                                )  # 너무 길면 자르기
+                            else:
+                                result_content = f"[MCP 도구 '{tool_name}' 결과 type: {type(mcp_result.content[0])}]"
+                                print(result_content)
+
+                        # Gemini에게 함수 실행 결과를 전달
+                        response = await self.chat_session.send_message_async(
+                            [
+                                {
+                                    "function_response": {
+                                        "name": tool_name,
+                                        "response": {"content": result_content},
+                                    }
+                                }
+                            ],
+                            tools=gemini_tools,
+                        )
+                        # final_text_parts.append(result_content) # 응답 결과는 Gemini가 생성하도록 함
+
+                    except Exception as tool_error:
+                        print(f"MCP 도구 '{tool_name}' 실행 중 오류: {tool_error}")
+                        final_text_parts.append(
+                            f"[오류: 도구 '{tool_name}' 실행 실패 - {tool_error}]"
+                        )
+                        break  # 오류 발생 시 중단
+                else:
+                    print(
+                        f"경고: Gemini로부터 예상치 못한 응답 형식을 받았습니다: {latest_response_part}"
+                    )
+                    break  # 루프 종료
+
+            return "\n".join(final_text_parts)
+
+        except Exception as e:
+            print(f"Gemini API 호출 중 오류 발생: {e}")
+            return f"오류: AI 모델과 통신 중 문제가 발생했습니다 - {e}"
+
+    async def chat_loop(self):
+        """대화형 채팅 루프를 실행합니다."""
+        print("\n--- MCP 클라이언트 (Gemini 연동, 다중 서버) 시작 ---")
+        print("쿼리를 입력하거나 'quit'를 입력하여 종료하세요.")
+
+        while True:
+            try:
+                query = await asyncio.to_thread(input, "\n나의 요청: ")
+                query = query.strip()
+                if query.lower() == "quit":
+                    break
+                if not query:
+                    continue
+                response_text = await self.process_query(query)
+                print("\nAI 응답:")
+                print(response_text)
+            except (EOFError, KeyboardInterrupt):
+                break
+            except Exception as e:
+                print(f"\n채팅 루프 중 오류 발생: {e}")
+
+        print("클라이언트를 종료합니다.")
+
+    async def cleanup(self):
+        """모든 MCP 연결 및 리소스 정리"""
+        print("\n리소스 정리 중...")
+        # AsyncExitStack이 관리하는 모든 컨텍스트(stdio_client, sse_client, ClientSession)를 닫음
+        await self.exit_stack.aclose()
+        print("클라이언트 종료됨.")
+
+
+# --- 설정 파일 로드 및 메인 실행 로직 ---
+async def run_client():
+    config_path = os.path.join(os.path.dirname(__file__), "mcp_config.json")
+    server_configs: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            full_config = json.load(f)
+        loaded_servers = full_config.get("mcpServers")
+        if isinstance(loaded_servers, dict):
+            server_configs = loaded_servers
+            print(
+                f"'{config_path}'에서 {len(server_configs)}개의 서버 설정을 로드했습니다."
+            )
+        else:
+            print(
+                f"경고: '{config_path}' 파일 형식이 잘못되었거나 'mcpServers' 키가 없습니다."
+            )
+
+    except FileNotFoundError:
+        print(
+            f"경고: 설정 파일 '{config_path}'를 찾을 수 없습니다. 서버 설정 없이 시작합니다."
+        )
+    except Exception as e:
+        print(f"설정 파일 로드 중 오류 발생: {e}")
+
+    if not server_configs:
+        print("실행할 MCP 서버 설정이 없습니다. 프로그램을 종료합니다.")
+        return
+
+    client = MultiMCPClient()
+    try:
+        await client.connect_all_servers(server_configs)
+        # 성공적으로 연결된 서버가 하나 이상 있을 때만 채팅 시작
+        if client.sessions:
+            await client.chat_loop()
+        else:
+            print("연결된 MCP 서버가 없어 채팅 루프를 시작할 수 없습니다.")
+    except Exception as e:
+        print(f"\n클라이언트 실행 중 심각한 오류 발생: {e}")
+    finally:
+        await client.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    # 간단한 시스템 환경 확인 (Node.js/Java 필요 여부 등)
+    # 예시: config에 npx가 있으면 node 필요, java -jar 있으면 java 필요 등
+    # ... (필요시 추가) ...
+    try:
+        asyncio.run(run_client())
+    except KeyboardInterrupt:
+        print("\n프로그램 강제 종료.")
