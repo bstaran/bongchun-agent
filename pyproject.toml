@@ -11,6 +11,8 @@ dependencies = [
     "mcp[cli]>=1.6.0",
     "numpy>=2.2.5",
     "openai-whisper>=20240930",
+    "google-generativeai>=0.8.5",
+    "mcp[cli]>=1.6.0",
     "python-dotenv>=1.1.0",
     "requests",
     "sounddevice>=0.5.1",
