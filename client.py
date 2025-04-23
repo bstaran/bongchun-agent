@@ -1,44 +1,51 @@
 import asyncio
 import os
-import sys
 import json
 import traceback
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 from contextlib import AsyncExitStack
 
-# MCP 관련 import
 from mcp import ClientSession, StdioServerParameters, types as mcp_types
 from mcp.client.stdio import stdio_client
-
-# 다른 전송 방식 클라이언트 임포트 (필요시)
 from mcp.client.sse import sse_client
 
-# from mcp.client.websocket import websocket_client
-
-# Google Gemini 관련 import (MultiMCPClient 클래스에서 사용)
 import google.generativeai as genai
-from google.generativeai.types import Tool, FunctionDeclaration
+from google.generativeai.types import (
+    Tool,
+    FunctionDeclaration,
+    GenerationConfig,
+)
+
+from google.generativeai.protos import FunctionResponse
 
 
-# --- MCP 클라이언트 클래스 ---
 class MultiMCPClient:
-    def __init__(self):
-        # 여러 세션을 관리하기 위한 딕셔너리
+    def __init__(
+        self,
+        model_name: str = "gemini-2.0-flash-latest",
+        safety_settings: Optional[List[Dict[str, Any]]] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        system_instruction: Optional[str] = None,
+    ):
         self.sessions: Dict[str, ClientSession] = {}
         self.exit_stack = AsyncExitStack()
-        self.all_mcp_tools: List[mcp_types.Tool] = []  # 모든 서버의 도구 통합
-        self.tool_to_server_map: Dict[str, str] = {}  # 도구 이름 -> 서버 이름 매핑
+        self.all_mcp_tools: List[mcp_types.Tool] = []
+        self.tool_to_server_map: Dict[str, str] = {}
 
-        # Google Gemini 모델 초기화 (기존과 유사)
-        # 참고: API 키 설정은 main.py에서 처리되므로 여기서는 모델만 초기화
-        self.gemini_model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash-preview-04-17",
-            # safety_settings=...
-            # generation_config=...
-        )
-        self.chat_session = self.gemini_model.start_chat(
-            enable_automatic_function_calling=True
-        )
+        try:
+            self.gemini_model = genai.GenerativeModel(
+                model_name=model_name,
+                safety_settings=safety_settings,
+                generation_config=generation_config,
+                system_instruction=system_instruction,
+            )
+            self.chat_session = self.gemini_model.start_chat(
+                enable_automatic_function_calling=True
+            )
+            print(f"✅ Gemini 모델 '{model_name}' 초기화 완료.")
+        except Exception as e:
+            print(f"❌ Gemini 모델 초기화 실패: {e}")
+            raise
 
     # MultiMCPClient 클래스 내부에 추가될 헬퍼 함수
     def _clean_schema_for_gemini(
@@ -46,7 +53,6 @@ class MultiMCPClient:
     ) -> Optional[Dict[str, Any]]:
         """Gemini FunctionDeclaration 스키마에 맞게 불필요한 필드를 제거하는 재귀 함수"""
         if not isinstance(schema, dict):
-            # inputSchema 자체가 없거나 dict가 아니면 None 반환 (parameters 없이 생성 시도)
             if path == "root":
                 print(
                     f"경고 [{tool_name}]: inputSchema가 없거나 딕셔너리가 아닙니다. parameters 없이 도구를 정의합니다."
@@ -105,7 +111,7 @@ class MultiMCPClient:
             # 모든 요소가 해당 타입인지 확인 (여기서는 간단히 문자열/숫자만 허용)
             valid_enum = [
                 val for val in enum_values if isinstance(val, (str, int, float, bool))
-            ]  # bool 추가
+            ]
             if valid_enum:
                 cleaned_schema["enum"] = valid_enum
             else:
@@ -119,44 +125,40 @@ class MultiMCPClient:
             if isinstance(properties, dict):
                 cleaned_properties = {}
                 for prop_name, prop_schema in properties.items():
-                    # 재귀 호출로 하위 속성 스키마 정리
                     cleaned_prop = self._clean_schema_for_gemini(
                         prop_schema, tool_name, f"{path}.properties.{prop_name}"
                     )
-                    if cleaned_prop:  # 유효한 스키마만 추가
+                    if cleaned_prop:
                         cleaned_properties[prop_name] = cleaned_prop
-                if cleaned_properties:  # 빈 properties는 추가하지 않음
+                if cleaned_properties:
                     cleaned_schema["properties"] = cleaned_properties
 
             # 5. required 처리 (type이 'object'이고 properties가 있을 때)
-            if "properties" in cleaned_schema:  # 정리된 properties가 있어야 함
+            if "properties" in cleaned_schema:
                 required = schema.get("required")
                 if isinstance(required, list):
-                    # required 항목이 문자열이고 cleaned_properties에 존재하는지 확인
                     valid_required = [
                         req
                         for req in required
                         if isinstance(req, str) and req in cleaned_schema["properties"]
                     ]
-                    if valid_required:  # 빈 required는 추가하지 않음
+                    if valid_required:
                         cleaned_schema["required"] = valid_required
 
         # 6. items 처리 (type이 'array'일 때)
         elif current_type == "array":
             items_schema = schema.get("items")
-            # 재귀 호출로 배열 항목 스키마 정리
             cleaned_items = self._clean_schema_for_gemini(
                 items_schema, tool_name, f"{path}.items"
             )
-            if cleaned_items:  # 유효한 스키마만 추가
+            if cleaned_items:
                 cleaned_schema["items"] = cleaned_items
             else:
                 print(
                     f"경고 [{tool_name}]: 스키마 경로 '{path}' (배열 타입)에 유효한 'items' 정의가 없습니다."
                 )
 
-        # 최종적으로 유효한 키가 하나라도 있는지 확인 (최소 type은 있어야 함)
-        return cleaned_schema if cleaned_schema else None  # 완전히 비면 None 반환
+        return cleaned_schema if cleaned_schema else None
 
     def _mcp_tools_to_gemini_tools(self) -> List[Tool]:
         """
@@ -177,12 +179,10 @@ class MultiMCPClient:
             processed_tool_names.add(tool.name)
 
             try:
-                # MCP inputSchema를 Gemini 호환 스키마로 정리
                 cleaned_parameters = self._clean_schema_for_gemini(
                     tool.inputSchema, tool.name
                 )
 
-                # FunctionDeclaration 생성 시도
                 func_decl = FunctionDeclaration(
                     name=tool.name,
                     description=(
@@ -190,14 +190,12 @@ class MultiMCPClient:
                         if not isinstance(tool.description, str)
                         else tool.description
                     ),
-                    # cleaned_parameters가 None이거나 비어있으면 parameters 자체를 전달하지 않음
                     parameters=cleaned_parameters if cleaned_parameters else None,
                 )
                 gemini_function_declarations.append(func_decl)
             except Exception as e:
-                # FunctionDeclaration 생성 시 여전히 오류가 발생할 수 있음
                 print(f"오류: 도구 '{tool.name}'의 FunctionDeclaration 생성 실패 - {e}")
-                # 실패 시 사용된 파라미터 로깅 (cleaned_parameters가 정의되었는지 확인)
+
                 params_for_log = (
                     cleaned_parameters
                     if "cleaned_parameters" in locals()
@@ -217,7 +215,7 @@ class MultiMCPClient:
         """지정된 stdio 서버에 연결하고 초기화하는 내부 함수"""
         command = config.get("command")
         args = config.get("args", [])
-        env = config.get("env", os.environ.copy())  # 없으면 현재 환경 사용
+        env = config.get("env", os.environ.copy())
         if not command:
             print(
                 f"경고: 서버 '{server_name}' 설정에 'command'가 없어 건너<0xEB><0x9C><0x9C>니다."
@@ -227,7 +225,6 @@ class MultiMCPClient:
         server_params = StdioServerParameters(command=command, args=args, env=env)
         try:
             print(f"'{server_name}' (stdio) 연결 시도: {command} {' '.join(args)}")
-            # enter_async_context를 사용하여 exit_stack으로 관리
             stdio_transport = await self.exit_stack.enter_async_context(
                 stdio_client(server_params)
             )
@@ -240,7 +237,6 @@ class MultiMCPClient:
             print(f"✅ '{server_name}' 세션 초기화 완료.")
             self.sessions[server_name] = session
 
-            # 이 서버의 도구 가져오기
             list_tools_result = await session.list_tools()
             server_tools = list_tools_result.tools if list_tools_result else []
             print(f"  '{server_name}' 제공 도구: {[t.name for t in server_tools]}")
@@ -250,17 +246,15 @@ class MultiMCPClient:
                     print(
                         f"경고: 도구 이름 '{tool.name}'이(가) '{self.tool_to_server_map[tool.name]}' 서버와 '{server_name}' 서버에 중복됩니다. '{server_name}'의 도구를 사용합니다."
                     )
-                self.tool_to_server_map[tool.name] = server_name  # 도구 <-> 서버 매핑
+                self.tool_to_server_map[tool.name] = server_name
 
         except Exception as e:
             print(f"❌ '{server_name}' 서버 연결 또는 초기화 실패: {e}")
-            # 연결 실패 시 해당 세션은 self.sessions에 추가되지 않음
 
-    # --- SSE/WebSocket 연결 함수 (필요시 추가) ---
     async def _connect_and_init_sse(self, server_name: str, config: Dict[str, Any]):
         """지정된 SSE 서버에 연결하고 초기화하는 내부 함수"""
         url = config.get("url")
-        headers = config.get("headers")  # 인증 등
+        headers = config.get("headers")
         if not url:
             print(
                 f"경고: SSE 서버 '{server_name}' 설정에 'url'이 없어 건너<0xEB><0x9C><0x9C>니다."
@@ -278,7 +272,7 @@ class MultiMCPClient:
             await session.initialize()
             print(f"✅ '{server_name}' (SSE) 세션 초기화 완료.")
             self.sessions[server_name] = session
-            # 도구 가져오기 및 매핑 (stdio와 동일 로직)
+
             list_tools_result = await session.list_tools()
             server_tools = list_tools_result.tools if list_tools_result else []
             print(f"  '{server_name}' 제공 도구: {[t.name for t in server_tools]}")
@@ -296,10 +290,9 @@ class MultiMCPClient:
         """설정 파일에 정의된 모든 서버에 병렬로 연결합니다."""
         tasks = []
         for server_name, config in server_configs.items():
-            transport_type = config.get("transport", "stdio").lower()  # 기본값 stdio
+            transport_type = config.get("transport", "stdio").lower()
 
             if transport_type == "stdio":
-                # command 필드가 있는지 확인 (stdio 필수)
                 if "command" in config:
                     tasks.append(self._connect_and_init_stdio(server_name, config))
                 else:
@@ -307,7 +300,6 @@ class MultiMCPClient:
                         f"경고: stdio 서버 '{server_name}' 설정에 'command'가 없어 건너<0xEB><0x9C><0x9C>니다."
                     )
             elif transport_type == "sse":
-                # url 필드가 있는지 확인 (sse 필수)
                 if "url" in config:
                     tasks.append(self._connect_and_init_sse(server_name, config))
                 else:
@@ -320,24 +312,20 @@ class MultiMCPClient:
                     f"경고: 지원되지 않는 전송 방식 '{transport_type}' (서버: {server_name}). 건너<0xEB><0x9C><0x9C>니다."
                 )
 
-        await asyncio.gather(*tasks)  # 모든 연결 시도를 병렬로 실행
+        await asyncio.gather(*tasks)
         print(
             f"\n총 {len(self.sessions)}개의 서버에 성공적으로 연결 및 초기화되었습니다."
-        )
-        print(
-            f"사용 가능한 전체 MCP 도구: {[tool.name for tool in self.all_mcp_tools]}"
         )
 
     async def process_query(self, query: str) -> str:
         """사용자 쿼리를 처리하고, 필요시 올바른 MCP 서버의 도구를 호출합니다."""
         if not self.sessions:
             return "오류: 연결된 MCP 서버가 없습니다."
+        if not hasattr(self, "chat_session"):
+            return "오류: Gemini 모델이 초기화되지 않았습니다."
 
         print("\nGemini 모델에게 요청 전송 중...")
         gemini_tools = self._mcp_tools_to_gemini_tools()
-        print(
-            f"[DEBUG] Gemini에게 전달될 도구 정보: {len(gemini_tools[0].function_declarations) if gemini_tools else 0}개"
-        )
 
         try:
             response = await self.chat_session.send_message_async(
@@ -350,7 +338,6 @@ class MultiMCPClient:
                     print("경고: Gemini로부터 응답 후보를 받지 못했습니다.")
                     break
 
-                # 수정: parts 접근 전에 content 존재 여부 확인
                 candidate_content = response.candidates[0].content
                 if not candidate_content or not candidate_content.parts:
                     print("경고: Gemini 응답에 내용(content or parts)이 없습니다.")
@@ -361,7 +348,7 @@ class MultiMCPClient:
 
                 latest_response_part = candidate_content.parts[0]
 
-                if latest_response_part.text:
+                if hasattr(latest_response_part, "text") and latest_response_part.text:
                     final_text_parts.append(latest_response_part.text)
                     break
 
@@ -372,26 +359,38 @@ class MultiMCPClient:
                     function_call = latest_response_part.function_call
                     tool_name = function_call.name
 
-                    # Gemini가 호출하려는 도구가 어떤 서버에 속하는지 확인
                     target_server_name = self.tool_to_server_map.get(tool_name)
                     if not target_server_name:
                         print(
                             f"❌ 오류: Gemini가 알 수 없는 도구 '{tool_name}' 호출을 시도했습니다."
                         )
-                        final_text_parts.append(
-                            f"[오류: 알 수 없는 도구 '{tool_name}']"
+                        response = await self.chat_session.send_message_async(
+                            FunctionResponse(
+                                name=tool_name,
+                                response={
+                                    "content": f"Error: Tool '{tool_name}' not found or not configured correctly."
+                                },
+                            ),
+                            tools=gemini_tools,
                         )
-                        break  # 오류 발생 시 중단
+                        continue
 
                     target_session = self.sessions.get(target_server_name)
                     if not target_session:
                         print(
                             f"❌ 오류: 도구 '{tool_name}'을 처리할 서버 '{target_server_name}'의 세션을 찾을 수 없습니다."
                         )
-                        final_text_parts.append(f"[오류: 도구 '{tool_name}' 처리 실패]")
-                        break  # 오류 발생 시 중단
+                        response = await self.chat_session.send_message_async(
+                            FunctionResponse(  # google.generativeai.types.FunctionResponse 사용
+                                name=tool_name,
+                                response={
+                                    "content": f"Error: Could not find active session for server '{target_server_name}' required by tool '{tool_name}'."
+                                },
+                            ),
+                            tools=gemini_tools,
+                        )
+                        continue
 
-                    # 인자 파싱 (기존 코드 유지)
                     tool_args_dict = {}
                     if hasattr(function_call, "args") and function_call.args:
                         try:
@@ -407,92 +406,104 @@ class MultiMCPClient:
                     print(
                         f"[Gemini 요청: 서버 '{target_server_name}'의 MCP 도구 '{tool_name}' 호출 (인자: {tool_args_dict})]"
                     )
-                    final_text_parts.append(
-                        f"[도구 호출: {tool_name}({json.dumps(tool_args_dict, ensure_ascii=False)})]"
-                    )
 
-                    # 해당 서버의 세션을 사용하여 MCP 도구 호출
                     try:
-                        # ★★★★★ 핵심: 올바른 세션으로 도구 호출 ★★★★★
+                        print(
+                            f"[DEBUG] Calling MCP tool '{tool_name}' on server '{target_server_name}' with args: {tool_args_dict}"
+                        )
                         mcp_result = await target_session.call_tool(
                             tool_name, arguments=tool_args_dict
                         )
-                        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                        print(f"[DEBUG] MCP tool '{tool_name}' result: {mcp_result}")
 
-                        # 결과 처리 (기존 코드 유지, 오류 발생 시 tool_result에 반영되도록 수정 필요)
-                        result_content = "[Tool executed successfully]"  # 기본 메시지
+                        result_content = "[Tool executed successfully, no specific content returned]"  # 기본 메시지
                         if mcp_result.isError:
-                            result_content = f"[오류: 도구 '{tool_name}' 실행 실패]"
-                            print(f"MCP 도구 '{tool_name}' 실행 오류 보고됨.")
+                            result_content = f"[Error executing tool '{tool_name}': {mcp_result.error.message if mcp_result.error else 'Unknown error'}]"
+                            print(
+                                f"MCP 도구 '{tool_name}' 실행 오류 보고됨: {result_content}"
+                            )
                         elif mcp_result.content:
-                            # 간단히 첫 번째 텍스트 콘텐츠 사용 (실제로는 더 복잡한 처리 필요)
-                            if isinstance(mcp_result.content[0], mcp_types.TextContent):
-                                result_content = mcp_result.content[0].text
+                            text_contents = [
+                                c.text
+                                for c in mcp_result.content
+                                if isinstance(c, mcp_types.TextContent)
+                            ]
+                            if text_contents:
+                                result_content = "\n".join(text_contents)
                                 print(
-                                    f"[MCP 도구 '{tool_name}' 결과]: {result_content[:200]}..."
-                                )  # 너무 길면 자르기
+                                    f"[MCP 도구 '{tool_name}' 결과]: {result_content[:200]}{'...' if len(result_content) > 200 else ''}"
+                                )
                             else:
-                                result_content = f"[MCP 도구 '{tool_name}' 결과 type: {type(mcp_result.content[0])}]"
-                                print(result_content)
+                                json_contents = [
+                                    c.model_dump_json
+                                    for c in mcp_result.content
+                                    if isinstance(c, mcp_types.JsonContent)
+                                ]
+                                if json_contents:
+                                    result_content = json.dumps(json_contents[0])
+                                    print(
+                                        f"[MCP 도구 '{tool_name}' JSON 결과]: {result_content[:200]}{'...' if len(result_content) > 200 else ''}"
+                                    )
+                                else:
+                                    result_content = f"[MCP 도구 '{tool_name}' 결과 type: {type(mcp_result.content[0])}]"
+                                    print(result_content)
 
-                        # Gemini에게 함수 실행 결과를 전달
+                        function_response_payload = FunctionResponse(
+                            name=tool_name,
+                            response={"content": result_content},
+                        )
+                        print(
+                            f"[DEBUG] Sending FunctionResponse to Gemini: {function_response_payload}"
+                        )
                         response = await self.chat_session.send_message_async(
-                            [
-                                {
-                                    "function_response": {
-                                        "name": tool_name,
-                                        "response": {"content": result_content},
-                                    }
-                                }
-                            ],
+                            function_response_payload,
                             tools=gemini_tools,
                         )
-                        # final_text_parts.append(result_content) # 응답 결과는 Gemini가 생성하도록 함
+                        print(
+                            f"[DEBUG] Response from Gemini after sending FunctionResponse: {response.candidates[0].content.parts[0] if response.candidates else 'No candidates'}"
+                        )
+                        continue
 
                     except Exception as tool_error:
-                        print(f"MCP 도구 '{tool_name}' 실행 중 오류: {tool_error}")
-                        final_text_parts.append(
-                            f"[오류: 도구 '{tool_name}' 실행 실패 - {tool_error}]"
+                        print(
+                            f"❌ ERROR during MCP tool '{tool_name}' execution: {tool_error}"
                         )
-                        break  # 오류 발생 시 중단
+                        traceback.print_exc()
+                        error_response_payload = FunctionResponse(
+                            name=tool_name,
+                            response={
+                                "content": f"Error: Exception during tool execution: {tool_error}"
+                            },
+                        )
+                        print(
+                            f"[DEBUG] Sending ERROR FunctionResponse to Gemini: {error_response_payload}"
+                        )
+                        response = await self.chat_session.send_message_async(
+                            error_response_payload,
+                            tools=gemini_tools,
+                        )
+                        print(
+                            f"[DEBUG] Response from Gemini after sending ERROR FunctionResponse: {response.candidates[0].content.parts[0] if response.candidates else 'No candidates'}"
+                        )
+                        continue
                 else:
                     print(
                         f"경고: Gemini로부터 예상치 못한 응답 형식을 받았습니다: {latest_response_part}"
                     )
-                    break  # 루프 종료
+                    if final_text_parts:
+                        break
+                    else:
+                        return f"오류: AI로부터 예상치 못한 응답 형식 수신: {latest_response_part}"
 
             return "\n".join(final_text_parts)
 
         except Exception as e:
             print(f"Gemini API 호출 중 오류 발생: {e}")
+            traceback.print_exc()
             return f"오류: AI 모델과 통신 중 문제가 발생했습니다 - {e}"
-
-    async def chat_loop(self):
-        """대화형 채팅 루프를 실행합니다."""
-        print("\n--- MCP 클라이언트 (Gemini 연동, 다중 서버) 시작 ---")
-        print("쿼리를 입력하거나 'quit'를 입력하여 종료하세요.")
-
-        while True:
-            try:
-                query = await asyncio.to_thread(input, "\n나의 요청: ")
-                query = query.strip()
-                if query.lower() == "quit":
-                    break
-                if not query:
-                    continue
-                response_text = await self.process_query(query)
-                print("\nAI 응답:")
-                print(response_text)
-            except (EOFError, KeyboardInterrupt):
-                break
-            except Exception as e:
-                print(f"\n채팅 루프 중 오류 발생: {e}")
-
-        print("클라이언트를 종료합니다.")
 
     async def cleanup(self):
         """모든 MCP 연결 및 리소스 정리"""
         print("\n리소스 정리 중...")
-        # AsyncExitStack이 관리하는 모든 컨텍스트(stdio_client, sse_client, ClientSession)를 닫음
         await self.exit_stack.aclose()
         print("클라이언트 종료됨.")
