@@ -7,7 +7,8 @@ import traceback
 import torch
 
 try:
-    import whisper
+    # import whisper
+    from faster_whisper import WhisperModel
     import sounddevice as sd
     import numpy as np
 except ImportError as e:
@@ -39,6 +40,7 @@ class STTService:
         self.whisper_model = None
         self.audio_queue = queue.Queue()
         self.stop_recording_event = threading.Event()
+        self.device = None
         self._load_model()
 
     def _load_model(self):
@@ -72,11 +74,19 @@ class STTService:
                 print("자동 감지: MPS/CUDA 사용 불가. CPU를 사용합니다.")
                 device = "cpu"
 
+        print(
+            f"실제 WhisperModel 로드 시도 모델: '{self.model_name}', 장치: '{device}'"
+        )
         try:
-            self.whisper_model = whisper.load_model(
-                self.model_name, device=device, download_root="./models"
+            self.whisper_model = WhisperModel(
+                self.model_name,
+                device=device,
+                compute_type="int8",
+                download_root="./models",
             )
-            print(f"Whisper 모델 로드 완료 (사용 장치: {device}).")
+            self.device = device
+
+            print(f"Whisper 모델 로드 완료 (사용 장치: {self.device}).")
         except Exception as e:
             print(f"Whisper 모델 로드 중 심각한 오류 발생: {e}")
             traceback.print_exc()
@@ -203,12 +213,10 @@ class STTService:
             print("변환할 오디오 데이터가 없습니다.")
             return ""
 
-        print(f"Whisper로 음성 변환 중 (장치: {self.whisper_model.device})...")
+        print(f"Whisper로 음성 변환 중")
         try:
-            use_fp16 = self.whisper_model.device != "cpu"
-
-            result = self.whisper_model.transcribe(audio_data, fp16=use_fp16)
-            transcribed_text = result["text"].strip()
+            segments, _info = self.whisper_model.transcribe(audio_data)
+            transcribed_text = "".join(segment.text for segment in segments).strip()
             print("음성 변환 완료.")
             return transcribed_text
         except Exception as e:
