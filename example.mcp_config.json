@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "terminal_executor": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/your/project",
+        "run",
+        "terminal_executor_server.py"
+      ]
+    }
+  }
+}

@@ -11,4 +11,5 @@ wheels/
 config.py
 
 .env
+mcp_config.json
 models/
