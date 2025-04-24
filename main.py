@@ -1,5 +1,4 @@
 import os
-
 import sys
 import google.generativeai as genai
 import json
@@ -8,6 +7,15 @@ import traceback
 
 from dotenv import load_dotenv
 from client import MultiMCPClient
+
+try:
+    from stt_service import STTService
+except ImportError:
+    sys.exit(1)
+except RuntimeError as e:
+    print(f"STT 서비스 초기화 실패: {e}")
+    sys.exit(1)
+
 
 load_dotenv()
 
@@ -82,7 +90,6 @@ try:
         except Exception as e:
             raise ValueError(f"GENERATION_CONFIG 처리 중 오류: {e}")
 
-    # MCP 서버 설정 로드
     mcp_config_path = "mcp_config.json"
     if not os.path.exists(mcp_config_path):
         raise FileNotFoundError(
@@ -95,6 +102,25 @@ try:
             raise ValueError(
                 f"'{mcp_config_path}' 파일에 'mcpServers' 객체가 없거나 형식이 잘못되었습니다."
             )
+
+    whisper_model_name = os.getenv("WHISPER_MODEL", "base")
+    if whisper_model_name == "base":
+        print(
+            "경고: 환경 변수 'WHISPER_MODEL'이 설정되지 않았습니다. 기본값 'base' 모델을 사용합니다."
+        )
+    else:
+        print(
+            f"환경 변수 'WHISPER_MODEL'에서 '{whisper_model_name}' 모델을 사용합니다."
+        )
+
+    whisper_device_pref = os.getenv("WHISPER_DEVICE", "auto").lower()
+    if whisper_device_pref not in ["auto", "cpu", "mps"]:
+        print(
+            f"경고: WHISPER_DEVICE 환경 변수 값 '{whisper_device_pref}'이(가) 유효하지 않습니다. 'auto' 설정을 사용합니다."
+        )
+        whisper_device_pref = "auto"
+    else:
+        print(f"환경 변수 'WHISPER_DEVICE' 설정: '{whisper_device_pref}'")
 
 
 except (ValueError, FileNotFoundError) as e:
@@ -129,10 +155,17 @@ async def main():
     """
     메인 비동기 애플리케이션 로직
     """
-    print("\n로컬 AI 에이전트 (MCP 클라이언트 연동)")
+    print("\n로컬 AI 에이전트 (MCP 클라이언트 + Whisper STT 연동)")
 
     mcp_client = None
+    stt_service = None
+
     try:
+        stt_service = STTService(
+            model_name=whisper_model_name,
+            device_preference=whisper_device_pref,
+        )
+
         mcp_client = MultiMCPClient(
             model_name=model_name,
             safety_settings=safety_settings,
@@ -152,14 +185,34 @@ async def main():
         print("\n(종료하려면 'exit' 또는 Ctrl+C 입력)")
 
         while True:
+            user_input = ""
             try:
-                user_input = await asyncio.to_thread(input, "\n요청사항을 입력하세요: ")
-                user_input = user_input.strip()
+                choice = await asyncio.to_thread(
+                    input,
+                    "\n요청사항을 입력하거나, 's'를 눌러 음성 입력을 시작하세요: ",
+                )
+                choice = choice.strip().lower()
 
-                if user_input.lower() == "exit":
+                if choice == "exit":
                     print("앱을 종료합니다.")
                     break
+                elif choice == "s":
+                    audio_data = await asyncio.to_thread(stt_service.record_audio)
+                    if audio_data is not None:
+                        user_input = await asyncio.to_thread(
+                            stt_service.transcribe_audio, audio_data
+                        )
+                        print(f"\n음성 인식 결과: {user_input}")
+                    else:
+                        print("오디오 녹음에 실패했거나 데이터가 없습니다.")
+                        continue
+                elif choice:
+                    user_input = choice
+                else:
+                    continue
+
                 if not user_input:
+                    print("입력된 내용이 없습니다.")
                     continue
 
                 print("\nAI에게 처리 요청 중...")
@@ -171,27 +224,40 @@ async def main():
 
             except EOFError:
                 print("\n입력 스트림이 닫혔습니다. 앱을 종료합니다.")
+                if stt_service:
+                    stt_service.stop_recording()
                 break
             except KeyboardInterrupt:
                 print("\nCtrl+C 입력 감지. 앱을 종료합니다.")
+                if stt_service:
+                    stt_service.stop_recording()
                 break
             except Exception as e:
                 print(f"\n루프 중 예상치 못한 오류 발생: {e}")
                 traceback.print_exc()
+                if stt_service:
+                    stt_service.stop_recording()
 
+    except RuntimeError as e:
+        print(f"애플리케이션 초기화 오류: {e}")
+        traceback.print_exc()
     except Exception as e:
         print(f"\n애플리케이션 시작 중 심각한 오류 발생: {e}")
         traceback.print_exc()
     finally:
+        print("\n애플리케이션 종료 처리 중...")
+        if stt_service:
+            stt_service.stop_recording()
         if mcp_client:
             await mcp_client.cleanup()
+        print("애플리케이션 종료 완료.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n프로그램 강제 종료.")
+        print("\n프로그램 강제 종료 확인.")
     except Exception as e:
         print(f"\n최상위 레벨 오류 발생: {e}")
         traceback.print_exc()
