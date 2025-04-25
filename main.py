@@ -17,6 +17,9 @@ except RuntimeError as e:
     sys.exit(1)
 
 
+# --- 사용자 정의 프롬프트 파일 경로 (필요시 수정) ---
+CUSTOM_PROMPT_FILE_PATH = "prompt/default.txt"
+
 load_dotenv()
 
 try:
@@ -132,29 +135,27 @@ except Exception as e:
     sys.exit(1)
 
 
-SYSTEM_PROMPT = """
-You are a highly capable AI assistant integrated with tools via the Model Context Protocol (MCP). Your primary function is to understand the user's request and **execute the appropriate MCP tool** to fulfill it. You MUST use the available tools whenever possible and relevant. Do NOT provide conversational answers if a tool can perform the requested action.
-
-Available Tools:
-You have access to tools provided by connected MCP servers. You MUST analyze the user's request and determine if any available tool can fulfill it. If a suitable tool exists, you MUST call that tool's function with the correct arguments.
-
-**Critical Instructions:**
-1.  **Analyze and Execute:** Carefully analyze the user's request. If the request involves actions like file operations (reading, writing, listing), running terminal commands, searching, or other tasks matching an available tool's description, you **MUST** call the corresponding tool function.
-2.  **Prioritize Tool Use:** Do not answer requests directly if a tool can perform the task. For example, if the user asks to "list files", call the `list_directory` tool instead of saying "I can list files for you". If the user asks to "run finder", call the `execute_terminal_command` tool with the appropriate command string.
-3.  **Terminal Commands:** For requests that require executing a terminal command (like opening applications, running scripts, managing processes), you **MUST** use the `execute_terminal_command` tool. Provide the exact command string needed for the `command` argument.
-4.  **Argument Accuracy:** When calling a tool, ensure all required arguments are provided correctly based on the tool's schema.
-5.  **Clarification:** If the request is ambiguous or lacks necessary information to use a tool (e.g., missing file path), ask the user for clarification. Do not attempt to guess or use a tool with incomplete information.
-6.  **Safety First:** Never use tools in a way that could harm the user's system or data. If a request seems unsafe or beyond the tools' capabilities, explain why you cannot fulfill it.
-7.  **Response Language:** Respond in Korean. Tool function calls themselves use standard naming conventions.
-
-Your goal is to act as an efficient agent, leveraging the provided tools to accomplish tasks, not just to chat. Process the user's request and determine the necessary tool call.
-"""
-
-
 async def main():
     """
     메인 비동기 애플리케이션 로직
     """
+    system_instruction = ""
+    if CUSTOM_PROMPT_FILE_PATH:
+        try:
+            with open(CUSTOM_PROMPT_FILE_PATH, "r", encoding="utf-8") as f:
+                system_instruction = f.read()
+            print(
+                f"\n'{CUSTOM_PROMPT_FILE_PATH}' 파일에서 시스템 프롬프트를 로드했습니다."
+            )
+        except FileNotFoundError:
+            print(
+                f"경고: 프롬프트 파일 '{CUSTOM_PROMPT_FILE_PATH}'을(를) 찾을 수 없습니다. 기본 프롬프트를 사용합니다."
+            )
+        except Exception as e:
+            print(
+                f"경고: 프롬프트 파일 '{CUSTOM_PROMPT_FILE_PATH}' 읽기 실패 - {e}. 기본 프롬프트를 사용합니다."
+            )
+
     print("\n로컬 AI 에이전트 (MCP 클라이언트 + Whisper STT 연동)")
 
     mcp_client = None
@@ -170,7 +171,7 @@ async def main():
             model_name=model_name,
             safety_settings=safety_settings,
             generation_config=generation_config,
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=system_instruction,
         )
 
         print("\nMCP 서버 연결 시도 중...")
