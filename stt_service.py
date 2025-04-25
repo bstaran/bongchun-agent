@@ -1,52 +1,93 @@
 import sys
+import os
 import threading
 import queue
 import time
 import traceback
+import io
+import wave
 
 import torch
 
 try:
-    # import whisper
     from faster_whisper import WhisperModel
     import sounddevice as sd
     import numpy as np
 except ImportError as e:
-    print(f"오류: STT 서비스에 필요한 라이브러리를 찾을 수 없습니다 ({e}).")
+    print(f"오류: Whisper STT 서비스에 필요한 라이브러리를 찾을 수 없습니다 ({e}).")
     print("다음 명령어를 실행하여 설치하세요:")
-    print("uv add openai-whisper sounddevice numpy")
-    raise
+    print("uv add faster-whisper sounddevice numpy torch")
+
+try:
+    from google.cloud import speech
+except ImportError:
+    print("경고: Google Cloud Speech 라이브러리를 찾을 수 없습니다.")
+    print("Google STT를 사용하려면 다음 명령어를 실행하여 설치하세요:")
+    print("uv add google-cloud-speech")
+    speech = None
 
 SAMPLE_RATE = 16000
-RECORD_SECONDS = 5
+RECORD_SECONDS = 10
 SILENCE_THRESHOLD = 500
 SILENCE_DURATION = 1.5
 
 
 class STTService:
     """
-    Whisper를 이용한 음성-텍스트 변환 서비스 클래스
+    Whisper 또는 Google Cloud를 이용한 음성-텍스트 변환 서비스 클래스
     """
 
-    def __init__(self, model_name="base", device_preference="auto"):
+    def __init__(
+        self,
+        provider="whisper",
+        whisper_model_name="base",
+        whisper_device_preference="auto",
+        google_lang_code="ko-KR",
+    ):
         """
-        서비스 초기화 및 Whisper 모델 로드
+        서비스 초기화 및 선택된 STT 제공자 설정
         Args:
-            model_name (str): 사용할 Whisper 모델 이름 또는 경로
-            device_preference (str): 사용할 장치 설정 ('auto', 'cpu', 'mps')
+            provider (str): 사용할 STT 제공자 ('whisper' 또는 'google')
+            whisper_model_name (str): Whisper 사용 시 모델 이름 또는 경로
+            whisper_device_preference (str): Whisper 사용 시 장치 설정 ('auto', 'cpu', 'mps')
+            google_lang_code (str): Google Cloud STT 사용 시 언어 코드
         """
-        self.model_name = model_name
-        self.device_preference = device_preference
-        self.whisper_model = None
+        self.provider = provider
         self.audio_queue = queue.Queue()
         self.stop_recording_event = threading.Event()
-        self.device = None
-        self._load_model()
 
-    def _load_model(self):
+        self.whisper_model = None
+        self.whisper_device = None
+        self.google_client = None
+        self.google_lang_code = google_lang_code
+
+        if self.provider == "whisper":
+            self.whisper_model_name = whisper_model_name
+            self.whisper_device_preference = whisper_device_preference
+            self._load_whisper_model()
+        elif self.provider == "google":
+            if speech is None:
+                raise RuntimeError(
+                    "Google Cloud Speech 라이브러리가 설치되지 않았습니다."
+                )
+            try:
+                print("Google Cloud Speech 클라이언트 초기화 중...")
+                self.google_client = speech.SpeechClient()
+                print("Google Cloud Speech 클라이언트 초기화 완료.")
+            except Exception as e:
+                print(f"Google Cloud Speech 클라이언트 초기화 실패: {e}")
+                traceback.print_exc()
+                raise RuntimeError("Google Cloud Speech 클라이언트 초기화 실패") from e
+        else:
+            raise ValueError(f"지원하지 않는 STT 제공자: {provider}")
+
+    def _load_whisper_model(self):
         """Whisper 모델 로드 (사용자 설정 또는 자동 감지 기반)"""
+        if "WhisperModel" not in globals():
+            raise RuntimeError("Faster Whisper 라이브러리가 로드되지 않았습니다.")
+
         print(
-            f"Whisper 모델 '{self.model_name}' 로드 중 (선호 장치: {self.device_preference})..."
+            f"Whisper 모델 '{self.whisper_model_name}' 로드 중 (선호 장치: {self.whisper_device_preference})..."
         )
         device = "cpu"
 
@@ -79,18 +120,20 @@ class STTService:
         )
         try:
             self.whisper_model = WhisperModel(
-                self.model_name,
+                self.whisper_model_name,
                 device=device,
                 compute_type="int8",
                 download_root="./models",
             )
-            self.device = device
+            self.whisper_device = device
 
-            print(f"Whisper 모델 로드 완료 (사용 장치: {self.device}).")
+            print(f"Whisper 모델 로드 완료 (사용 장치: {self.whisper_device}).")
         except Exception as e:
             print(f"Whisper 모델 로드 중 심각한 오류 발생: {e}")
             traceback.print_exc()
-            raise RuntimeError(f"Whisper 모델 '{self.model_name}' 로드 실패") from e
+            raise RuntimeError(
+                f"Whisper 모델 '{self.whisper_model_name}' 로드 실패"
+            ) from e
 
     def _audio_callback(self, indata, frames, time, status):
         """사운드 장치에서 호출되는 콜백 함수"""
@@ -201,26 +244,92 @@ class STTService:
             traceback.print_exc()
             return None
 
-    def transcribe_audio(self, audio_data):
+    def _numpy_to_wav_bytes(self, audio_data_np: np.ndarray) -> bytes:
+        """NumPy float32 오디오 데이터를 WAV 형식의 바이트 스트림으로 변환"""
+        if audio_data_np is None or audio_data_np.size == 0:
+            return b""
+        # float32 [-1.0, 1.0] -> int16 [-32768, 32767]
+        audio_data_int16 = (audio_data_np * 32767).astype(np.int16)
+
+        bytes_io = io.BytesIO()
+        with wave.open(bytes_io, "wb") as wf:
+            wf.setnchannels(1)  # Mono
+            wf.setsampwidth(2)  # 16-bit = 2 bytes
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(audio_data_int16.tobytes())
+        return bytes_io.getvalue()
+
+    def transcribe_audio(self, audio_data_np: np.ndarray) -> str:
         """
-        Whisper 모델을 사용하여 오디오 데이터를 텍스트로 변환.
-        이 함수는 동기적으로 실행되므로 별도 스레드에서 호출해야 합니다.
+        선택된 STT 제공자를 사용하여 오디오 데이터를 텍스트로 변환.
+        Args:
+            audio_data_np (np.ndarray): float32 형식의 NumPy 오디오 데이터
+        Returns:
+            str: 변환된 텍스트
         """
-        if self.whisper_model is None:
-            print("오류: Whisper 모델이 로드되지 않았습니다.")
-            return ""
-        if audio_data is None or len(audio_data) == 0:
+        if audio_data_np is None or audio_data_np.size == 0:
             print("변환할 오디오 데이터가 없습니다.")
             return ""
 
-        print(f"Whisper로 음성 변환 중")
+        if self.provider == "whisper":
+            return self._transcribe_whisper(audio_data_np)
+        elif self.provider == "google":
+            return self._transcribe_google(audio_data_np)
+        else:
+            print(f"오류: 알 수 없는 STT 제공자 '{self.provider}'")
+            return ""
+
+    def _transcribe_whisper(self, audio_data_np: np.ndarray) -> str:
+        """Whisper를 사용하여 변환"""
+        if self.whisper_model is None:
+            print("오류: Whisper 모델이 로드되지 않았습니다.")
+            return ""
+        print(f"Whisper로 음성 변환 중 (장치: {self.whisper_device})...")
         try:
-            segments, _info = self.whisper_model.transcribe(audio_data)
+            segments, _info = self.whisper_model.transcribe(
+                audio_data_np, language="ko"
+            )
             transcribed_text = "".join(segment.text for segment in segments).strip()
-            print("음성 변환 완료.")
+            print("Whisper 변환 완료.")
             return transcribed_text
         except Exception as e:
             print(f"Whisper 변환 중 오류 발생: {e}")
+            traceback.print_exc()
+            return ""
+
+    def _transcribe_google(self, audio_data_np: np.ndarray) -> str:
+        """Google Cloud Speech를 사용하여 변환"""
+        if self.google_client is None:
+            print("오류: Google Cloud Speech 클라이언트가 초기화되지 않았습니다.")
+            return ""
+
+        print(f"Google Cloud STT로 음성 변환 중 (언어: {self.google_lang_code})...")
+        try:
+            audio_bytes = self._numpy_to_wav_bytes(audio_data_np)
+            if not audio_bytes:
+                print("오류: 오디오 데이터를 WAV 바이트로 변환 실패.")
+                return ""
+
+            audio = speech.RecognitionAudio(content=audio_bytes)
+            config = speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=SAMPLE_RATE,
+                language_code=self.google_lang_code,
+            )
+
+            response = self.google_client.recognize(config=config, audio=audio)
+
+            if response.results:
+                transcribed_text = (
+                    response.results[0].alternatives[0].transcript.strip()
+                )
+                print("Google Cloud STT 변환 완료.")
+                return transcribed_text
+            else:
+                print("Google Cloud STT 결과 없음.")
+                return ""
+        except Exception as e:
+            print(f"Google Cloud STT 변환 중 오류 발생: {e}")
             traceback.print_exc()
             return ""
 
@@ -233,22 +342,43 @@ class STTService:
 async def test_stt_service():
     """stt_service.py 단독 실행 시 테스트 함수"""
     print("STT 서비스 테스트 시작...")
+    test_provider = os.getenv("STT_PROVIDER", "whisper").lower()
+    print(f"테스트할 STT 제공자: {test_provider}")
+
+    if test_provider == "google" and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        print(
+            "\n경고: Google STT 테스트를 위해 GOOGLE_APPLICATION_CREDENTIALS 환경 변수를 설정해야 합니다."
+        )
+        print("테스트를 건너뜁니다.\n")
+        return
+    elif test_provider == "google" and os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        if not os.path.exists(os.getenv("GOOGLE_APPLICATION_CREDENTIALS")):
+            print(
+                f"\n경고: GOOGLE_APPLICATION_CREDENTIALS 경로 '{os.getenv('GOOGLE_APPLICATION_CREDENTIALS')}'에 파일이 없습니다."
+            )
+            print("Google STT 테스트를 건너뜁니다.\n")
+            return
+
     try:
-        stt = STTService(model_name="base")
+        stt = STTService(
+            provider=test_provider,
+            whisper_model_name=os.getenv("WHISPER_MODEL", "base"),
+            whisper_device_preference=os.getenv("WHISPER_DEVICE", "auto"),
+        )
 
         print("\n--- 녹음 테스트 ---")
-        audio = await asyncio.to_thread(stt.record_audio)
+        audio_np = await asyncio.to_thread(stt.record_audio)
 
-        if audio is not None:
-            print(f"녹음된 오디오 데이터 길이: {len(audio)} 샘플")
+        if audio_np is not None:
+            print(f"녹음된 오디오 데이터 길이: {len(audio_np)} 샘플")
             print("\n--- 변환 테스트 ---")
-            text = await asyncio.to_thread(stt.transcribe_audio, audio)
-            print(f"\n변환된 텍스트: '{text}'")
+            text = await asyncio.to_thread(stt.transcribe_audio, audio_np)
+            print(f"\n변환된 텍스트 ({stt.provider}): '{text}'")
         else:
             print("녹음에 실패하여 변환 테스트를 건너뜁니다.")
 
     except RuntimeError as e:
-        print(f"STT 서비스 초기화 실패: {e}")
+        print(f"STT 서비스 ({test_provider}) 초기화 또는 테스트 실패: {e}")
     except Exception as e:
         print(f"테스트 중 오류 발생: {e}")
         traceback.print_exc()
