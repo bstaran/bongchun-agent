@@ -273,6 +273,13 @@ class ChatGUI:
         )
         self.response_area.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
 
+        # --- 단축키 바인딩 ---
+        # 음성 입력 시작 단축키 (Shift+Control+Option+Command+T)
+        # macOS Tkinter 표현 시도
+        self.root.bind(
+            "<Shift-Control-Option-Command-T>", self._voice_input_handler_wrapper
+        )
+
     def _insert_newline(self, event):
         """Shift+Enter 입력 시 줄바꿈 삽입"""
         self.prompt_entry.insert(tk.INSERT, "\n")
@@ -322,7 +329,8 @@ class ChatGUI:
         """STT 작업을 별도 스레드에서 실행"""
         try:
             audio_data = self.stt_service.record_audio()  # 동기 호출
-            if audio_data:
+            # NumPy 배열의 존재 및 내용 확인 (None이 아니고 size가 0보다 큰지)
+            if audio_data is not None and audio_data.size > 0:
                 user_input = self.stt_service.transcribe_audio(audio_data)  # 동기 호출
                 if user_input:
                     self.response_queue.put(f"Voice Input Recognized: {user_input}")
@@ -342,6 +350,21 @@ class ChatGUI:
             self.response_queue.put(f"System: 음성 입력 중 오류: {e}")
             traceback.print_exc()
             self.response_queue.put("System: Buttons enabled")  # 버튼 다시 활성화
+
+    def _voice_input_handler_wrapper(self, event=None):
+        """단축키 이벤트를 처리하고 음성 입력 핸들러 호출"""
+        # 버튼이 활성화 상태일 때만 음성 입력 실행
+        if (
+            self.stt_service
+            and self.stt_button
+            and self.stt_button["state"] == tk.NORMAL
+        ):
+            self._voice_input_handler()
+        else:
+            # 음성 입력 비활성화 시 사용자에게 알림 (선택 사항)
+            # self._display_response("System: 음성 입력 기능이 비활성화되어 있거나 사용할 수 없습니다.")
+            print("음성 입력 단축키: STT 서비스 비활성화 또는 버튼 비활성 상태")
+        return "break"  # 이벤트 전파 중지
 
     async def _process_ai_query(self, query):
         """비동기로 AI 쿼리 처리"""
