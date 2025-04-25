@@ -139,6 +139,31 @@ try:
     else:
         print(f"환경 변수 'WHISPER_DEVICE' 설정: '{whisper_device_pref}'")
 
+    # --- STT Provider 설정 ---
+    stt_provider = os.getenv("STT_PROVIDER", "whisper").lower()
+    if stt_provider not in ["whisper", "google"]:
+        print(
+            f"경고: STT_PROVIDER 환경 변수 값 '{stt_provider}'이(가) 유효하지 않습니다. 'whisper' 설정을 사용합니다."
+        )
+        stt_provider = "whisper"
+    print(f"사용할 STT 제공자: '{stt_provider}'")
+
+    # Google Cloud STT 사용 시 인증 정보 확인
+    google_credentials = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if stt_provider == "google" and not google_credentials:
+        print(
+            "\n경고: STT_PROVIDER가 'google'로 설정되었지만 GOOGLE_APPLICATION_CREDENTIALS 환경 변수가 설정되지 않았습니다."
+        )
+        print("Google Cloud 인증에 실패할 수 있습니다. .env 파일을 확인하세요.\n")
+    elif stt_provider == "google" and google_credentials:
+        if not os.path.exists(google_credentials):
+            print(
+                f"\n경고: GOOGLE_APPLICATION_CREDENTIALS 경로 '{google_credentials}'에 파일이 존재하지 않습니다."
+            )
+            print("Google Cloud 인증에 실패할 수 있습니다.\n")
+        else:
+            print(f"Google Cloud 인증 파일 경로: '{google_credentials}'")
+
 
 except (ValueError, FileNotFoundError) as e:
     print(f"오류: 설정 로드 실패 - {e}")
@@ -190,19 +215,26 @@ class ChatGUI:
         """MCP 클라이언트와 STT 서비스 초기화"""
         try:
             try:
+                print(f"STT 서비스 초기화 시도 (제공자: {stt_provider})...")
                 self.stt_service = STTService(
-                    model_name=whisper_model_name,
-                    device_preference=whisper_device_pref,
+                    provider=stt_provider,
+                    whisper_model_name=whisper_model_name,
+                    whisper_device_preference=whisper_device_pref,
                 )
-                print("STT 서비스 초기화 완료.")
+                print(f"STT 서비스 ({stt_provider}) 초기화 완료.")
             except NameError:
                 print(
-                    "경고: STTService를 import할 수 없어 음성 입력 기능이 비활성화됩니다."
+                    "오류: STTService 클래스를 import할 수 없습니다. stt_service.py 파일을 확인하세요."
+                )
+                self.stt_service = None
+            except ImportError as ie:
+                print(
+                    f"오류: STT 서비스 의존성 로드 실패 ({ie}). 음성 입력 기능이 비활성화됩니다."
                 )
                 self.stt_service = None
             except RuntimeError as e:
                 print(
-                    f"경고: STT 서비스 초기화 실패 ({e}). 음성 입력 기능이 비활성화됩니다."
+                    f"경고: STT 서비스 ({stt_provider}) 초기화 실패 ({e}). 음성 입력 기능이 비활성화됩니다."
                 )
                 self.stt_service = None
 
