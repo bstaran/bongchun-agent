@@ -108,7 +108,6 @@ class MultiMCPClient:
             "number",
             "integer",
         ]:
-            # 모든 요소가 해당 타입인지 확인 (여기서는 간단히 문자열/숫자만 허용)
             valid_enum = [
                 val for val in enum_values if isinstance(val, (str, int, float, bool))
             ]
@@ -317,19 +316,31 @@ class MultiMCPClient:
             f"\n총 {len(self.sessions)}개의 서버에 성공적으로 연결 및 초기화되었습니다."
         )
 
-    async def process_query(self, query: str) -> str:
-        """사용자 쿼리를 처리하고, 필요시 올바른 MCP 서버의 도구를 호출합니다."""
+    async def process_query(
+        self, query: str, prompt_content: Optional[str] = None
+    ) -> str:
+        """
+        사용자 쿼리를 처리하고, 필요시 올바른 MCP 서버의 도구를 호출합니다.
+        prompt_content가 제공되면 이를 쿼리 앞에 추가하여 컨텍스트를 제공합니다.
+        """
         if not self.sessions:
-            return "오류: 연결된 MCP 서버가 없습니다."
+            print("경고: 연결된 MCP 서버가 없습니다. 도구 사용이 제한됩니다.")
         if not hasattr(self, "chat_session"):
             return "오류: Gemini 모델이 초기화되지 않았습니다."
+
+        full_query = query
+        if prompt_content:
+            full_query = f"{prompt_content}\n\n---\n\nUser Request:\n{query}"
+            print(f"\n[DEBUG] Combined query with prompt:\n{full_query[:200]}...")
+        else:
+            print("\n[DEBUG] Processing query without additional prompt content.")
 
         print("\nGemini 모델에게 요청 전송 중...")
         gemini_tools = self._mcp_tools_to_gemini_tools()
 
         try:
             response = await self.chat_session.send_message_async(
-                query, tools=gemini_tools
+                full_query, tools=gemini_tools
             )
 
             final_text_parts = []
@@ -381,7 +392,7 @@ class MultiMCPClient:
                             f"❌ 오류: 도구 '{tool_name}'을 처리할 서버 '{target_server_name}'의 세션을 찾을 수 없습니다."
                         )
                         response = await self.chat_session.send_message_async(
-                            FunctionResponse(  # google.generativeai.types.FunctionResponse 사용
+                            FunctionResponse(
                                 name=tool_name,
                                 response={
                                     "content": f"Error: Could not find active session for server '{target_server_name}' required by tool '{tool_name}'."
@@ -416,7 +427,9 @@ class MultiMCPClient:
                         )
                         print(f"[DEBUG] MCP tool '{tool_name}' result: {mcp_result}")
 
-                        result_content = "[Tool executed successfully, no specific content returned]"  # 기본 메시지
+                        result_content = (
+                            "[Tool executed successfully, no specific content returned]"
+                        )
                         if mcp_result.isError:
                             result_content = f"[Error executing tool '{tool_name}': {mcp_result.error.message if mcp_result.error else 'Unknown error'}]"
                             print(
