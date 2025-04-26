@@ -5,7 +5,7 @@ import json
 import asyncio
 import traceback
 import tkinter as tk
-from tkinter import scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, ttk
 import threading
 import queue
 import platform
@@ -31,8 +31,7 @@ except RuntimeError as e:
     sys.exit(1)
 
 
-# --- 사용자 정의 프롬프트 파일 경로 (필요시 수정) ---
-CUSTOM_PROMPT_FILE_PATH = "prompt/default.txt"
+# CLI 인자 파싱 함수 제거됨
 
 load_dotenv()
 
@@ -180,7 +179,7 @@ class ChatGUI:
         self.loop = loop
         self.root = tk.Tk()
         self.root.title("AI Agent Chat")
-        self.root.geometry("600x500")
+        self.root.geometry("600x550")
 
         self.mcp_client = None
         self.stt_service = None
@@ -188,10 +187,22 @@ class ChatGUI:
         self.hotkey_listener = None
         self.recording_status_label = None
 
-        self._setup_system_instruction()
+        # --- 프롬프트 관련 변수 ---
+        self.prompt_dir = "prompt"
+        self.available_prompts = self._load_prompts()
+        self.prompt_var = tk.StringVar(self.root)
+        self.selected_prompt_content = ""
+        self.default_prompt_path = os.path.join(self.prompt_dir, "default.txt")
+
+        # --- 서비스 초기화 ---
         self._initialize_services()
         self._create_widgets()
         self._check_queue()
+
+        # 초기 프롬프트 로드
+        if self.available_prompts:
+            self.prompt_var.set(self.available_prompts[0])
+            self._load_selected_prompt_content()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
@@ -199,20 +210,70 @@ class ChatGUI:
             print("\nMCP 서버 연결 시도 중 (백그라운드)...")
             asyncio.run_coroutine_threadsafe(self._connect_mcp_servers(), self.loop)
 
-    def _setup_system_instruction(self):
-        self.system_instruction = ""
-        if CUSTOM_PROMPT_FILE_PATH:
+    # --- 프롬프트 로딩 관련 메서드 ---
+    def _load_prompts(self):
+        """Loads .txt file names (without extension) from the prompt directory."""
+        prompts = []
+        if os.path.isdir(self.prompt_dir):
             try:
-                with open(CUSTOM_PROMPT_FILE_PATH, "r", encoding="utf-8") as f:
-                    self.system_instruction = f.read()
-                print(f"'{CUSTOM_PROMPT_FILE_PATH}'에서 시스템 프롬프트 로드됨.")
-            except FileNotFoundError:
-                print(f"경고: 프롬프트 파일 '{CUSTOM_PROMPT_FILE_PATH}' 없음.")
-            except Exception as e:
-                print(f"경고: 프롬프트 파일 읽기 실패 - {e}.")
+                for filename in os.listdir(self.prompt_dir):
+                    if filename.endswith(".txt"):
+                        prompts.append(os.path.splitext(filename)[0])
+            except OSError as e:
+                messagebox.showerror("Error", f"Could not read prompt directory: {e}")
+
+        if "default" not in prompts and os.path.exists(self.default_prompt_path):
+            prompts.insert(0, "default")
+        elif not prompts and not os.path.exists(self.default_prompt_path):
+            messagebox.showwarning(
+                "Warning", "No prompts found, including default.txt."
+            )
+            return ["default"]
+
+        if "default" in prompts:
+            prompts.remove("default")
+            prompts.insert(0, "default")
+        return prompts if prompts else ["default"]
+
+    def _load_selected_prompt_content(self):
+        """Loads the content of the currently selected prompt file."""
+        selected_prompt_name = self.prompt_var.get()
+        prompt_file_path = os.path.join(self.prompt_dir, f"{selected_prompt_name}.txt")
+
+        try:
+            if os.path.exists(prompt_file_path):
+                with open(prompt_file_path, "r", encoding="utf-8") as f:
+                    self.selected_prompt_content = f.read()
+                print(f"Loaded prompt content from: {prompt_file_path}")
+            elif os.path.exists(self.default_prompt_path):
+                messagebox.showwarning(
+                    "Warning",
+                    f"Prompt '{selected_prompt_name}.txt' not found. Using default prompt.",
+                )
+                with open(self.default_prompt_path, "r", encoding="utf-8") as f:
+                    self.selected_prompt_content = f.read()
+                self.prompt_var.set("default")
+                print(f"Loaded default prompt content from: {self.default_prompt_path}")
+            else:
+                messagebox.showerror("Error", "Default prompt 'default.txt' not found.")
+                self.selected_prompt_content = ""
+        except OSError as e:
+            messagebox.showerror("Error", f"Could not read prompt file: {e}")
+            self.selected_prompt_content = ""
+        except Exception as e:
+            messagebox.showerror(
+                "Error", f"An unexpected error occurred reading prompt: {e}"
+            )
+            self.selected_prompt_content = ""
+
+    def _on_prompt_select(self, event=None):
+        """Callback when a prompt is selected from the dropdown."""
+        self._load_selected_prompt_content()
+        self.root.title(f"AI Agent Chat (Prompt: {self.prompt_var.get()})")
 
     def _initialize_services(self):
         """MCP 클라이언트와 STT 서비스 초기화"""
+
         try:
             try:
                 print(f"STT 서비스 초기화 시도 (제공자: {stt_provider})...")
@@ -242,7 +303,7 @@ class ChatGUI:
                 model_name=model_name,
                 safety_settings=safety_settings,
                 generation_config=generation_config,
-                system_instruction=self.system_instruction,
+                system_instruction=None,
             )
             print("MCP 클라이언트 초기화 완료.")
 
@@ -270,22 +331,47 @@ class ChatGUI:
 
     def _create_widgets(self):
         """GUI 위젯 생성 및 배치"""
-        prompt_frame = tk.Frame(self.root)
-        prompt_frame.pack(pady=10, padx=10, fill=tk.X)
 
-        prompt_label = tk.Label(prompt_frame, text="Prompt:")
-        prompt_label.pack(side=tk.LEFT, padx=5)
+        prompt_select_frame = tk.Frame(self.root)
+        prompt_select_frame.pack(pady=(10, 5), padx=10, fill=tk.X)
 
-        self.prompt_entry = scrolledtext.ScrolledText(
-            prompt_frame, height=4, wrap=tk.WORD
+        prompt_select_label = tk.Label(prompt_select_frame, text="Select Prompt:")
+        prompt_select_label.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.prompt_dropdown = ttk.Combobox(
+            prompt_select_frame,
+            textvariable=self.prompt_var,
+            values=self.available_prompts,
+            state="readonly",
+            width=30,
         )
-        self.prompt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.prompt_entry.focus()
-        # Enter 키 바인딩 추가
-        self.prompt_entry.bind("<Return>", self._send_prompt_handler)
-        self.prompt_entry.bind("<Shift-Return>", self._insert_newline)
+        if self.available_prompts:
+            self.prompt_dropdown.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self.prompt_dropdown.bind("<<ComboboxSelected>>", self._on_prompt_select)
+        else:
+            no_prompt_label = tk.Label(
+                prompt_select_frame,
+                text="No prompts found in 'prompt' directory.",
+                fg="grey",
+            )
+            no_prompt_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # 버튼 프레임
+        # --- 사용자 요청 입력 프레임 ---
+        request_frame = tk.Frame(self.root)
+        request_frame.pack(pady=5, padx=10, fill=tk.X)
+
+        request_label = tk.Label(request_frame, text="Your Request:")
+        request_label.pack(side=tk.LEFT, padx=5, anchor=tk.N)
+
+        self.request_entry = scrolledtext.ScrolledText(
+            request_frame, height=6, wrap=tk.WORD
+        )
+        self.request_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.request_entry.focus()
+        self.request_entry.bind("<Return>", self._send_prompt_handler)
+        self.request_entry.bind("<Shift-Return>", self._insert_newline)
+
+        # --- 버튼 프레임 ---
         button_frame = tk.Frame(self.root)
         button_frame.pack(pady=5, padx=10)
 
@@ -313,26 +399,34 @@ class ChatGUI:
         )
         self.response_area.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
 
-        # 메시지 정렬을 위한 태그 설정
         self.response_area.tag_configure("user_message", justify="right")
         self.response_area.tag_configure("ai_message", justify="left")
 
-        # 녹음 상태 표시 레이블 추가 (초기에는 숨김)
         self.recording_status_label = tk.Label(
             self.root, text="", fg="red", font=("Helvetica", 10)
         )
         self.recording_status_label.pack_forget()
 
     def _insert_newline(self, event):
-        """Shift+Enter 입력 시 줄바꿈 삽입"""
-        self.prompt_entry.insert(tk.INSERT, "\n")
+        """Shift+Enter 입력 시 줄바꿈 삽입 (request_entry에 적용)"""
+        self.request_entry.insert(tk.INSERT, "\n")
         return "break"
 
     def _send_prompt_handler(self, event=None):
         """전송 버튼 클릭 또는 Enter 키 입력 시 호출될 핸들러"""
-        prompt_text = self.prompt_entry.get("1.0", tk.END).strip()
-        if not prompt_text:
+        user_request = self.request_entry.get("1.0", tk.END).strip()
+        if not user_request:
+            messagebox.showwarning("Input Error", "Please enter your request.")
             return "break"
+
+        if not self.selected_prompt_content:
+            self._load_selected_prompt_content()
+            if not self.selected_prompt_content:
+                messagebox.showerror(
+                    "Error",
+                    "Cannot send request without prompt content (default.txt missing?).",
+                )
+                return "break"
 
         if not self.mcp_client:
             messagebox.showerror("오류", "MCP 클라이언트가 준비되지 않았습니다.")
@@ -343,11 +437,14 @@ class ChatGUI:
                 "연결 오류", "연결된 MCP 서버가 없습니다. 텍스트 생성만 가능합니다."
             )
 
-        self._display_response(f"You: {prompt_text}")
-        self.prompt_entry.delete("1.0", tk.END)
+        self._display_response(f"You: {user_request}")
+        self.request_entry.delete("1.0", tk.END)
         self._disable_buttons()
 
-        asyncio.run_coroutine_threadsafe(self._process_ai_query(prompt_text), self.loop)
+        asyncio.run_coroutine_threadsafe(
+            self._process_ai_query(user_request, self.selected_prompt_content),
+            self.loop,
+        )
         return "break"
 
     def _voice_input_handler(self):
@@ -403,11 +500,13 @@ class ChatGUI:
             print("음성 입력 단축키: STT 서비스 비활성화 또는 버튼 비활성 상태")
         return "break"
 
-    async def _process_ai_query(self, query):
-        """비동기로 AI 쿼리 처리"""
+    async def _process_ai_query(self, query, prompt_content):
+        """비동기로 AI 쿼리 처리 (프롬프트 내용 포함)"""
         try:
             self.response_queue.put("System: AI 처리 중...")
-            ai_response = await self.mcp_client.process_query(query)
+            ai_response = await self.mcp_client.process_query(
+                query, prompt_content=prompt_content
+            )
             self.response_queue.put(f"AI: {ai_response}")
         except Exception as e:
             self.response_queue.put(f"System: AI 처리 중 오류 발생: {e}")
@@ -418,16 +517,14 @@ class ChatGUI:
     def _display_response(self, text):
         """답변 영역에 텍스트 표시 (정렬 포함)"""
         self.response_area.config(state=tk.NORMAL)
-        start_index = self.response_area.index(tk.END + "-1c")  # 삽입될
+        start_index = self.response_area.index(tk.END + "-1c")
         self.response_area.insert(tk.END, text + "\n\n")
         end_index = self.response_area.index(tk.END + "-1c")
 
-        # 메시지 내용에 따라 태그 적용
         if text.startswith("You:"):
             self.response_area.tag_add("user_message", start_index, end_index)
         elif text.startswith("AI:"):
             self.response_area.tag_add("ai_message", start_index, end_index)
-        # 'System:' 메시지는 기본 정렬(왼쪽) 유지
 
         self.response_area.see(tk.END)
         self.response_area.config(state=tk.DISABLED)
@@ -521,7 +618,7 @@ def on_activate_voice_input(app_instance):
 
 
 # --- GUI 실행 함수 ---
-def run_gui():
+def run_gui(args):
     """GUI 애플리케이션을 초기화하고 실행합니다."""
     async_loop = asyncio.new_event_loop()
 
@@ -543,7 +640,6 @@ def run_gui():
                 )
                 shortcut_combination = "<ctrl>+<alt>+<shift>+t"
 
-            # app 인스턴스를 클로저로 캡처하여 전달
             def create_callback(app_instance):
                 return lambda: on_activate_voice_input(app_instance)
 
@@ -560,24 +656,19 @@ def run_gui():
         else:
             print("pynput 라이브러리가 없어 전역 단축키 기능을 시작할 수 없습니다.")
 
-        app.run()  # GUI 메인 루프 시작
+        app.run()
 
     except Exception as e:
         print(f"\nGUI 실행 중 오류 발생: {e}")
         traceback.print_exc()
     finally:
-        # GUI가 종료될 때 비동기 루프도 함께 종료되도록 처리
         if async_loop.is_running():
             print("GUI 종료: 비동기 루프에 종료 요청...")
             async_loop.call_soon_threadsafe(async_loop.stop)
-            # loop_thread가 완전히 종료될 때까지 기다릴 수 있지만,
-            # daemon=True이므로 메인 스레드가 종료되면 자동으로 종료됩니다.
-            # loop_thread.join() # 필요하다면 추가
 
         print("run_gui 함수 종료.")
 
 
-# --- 메인 실행 부분 ---
 if __name__ == "__main__":
     print("app.py 직접 실행됨. GUI 시작...")
-    run_gui()
+    run_gui(None)

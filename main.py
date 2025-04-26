@@ -34,7 +34,7 @@ def main():
     """
     print("main.py 실행됨. bongchun_agent GUI 시작...")
     try:
-        run_gui()  # 임포트한 함수 호출
+        run_gui(None)  # 임포트한 함수 호출
         print("GUI 애플리케이션이 정상적으로 종료되었습니다.")
     except Exception as e:
         print(f"GUI 실행 중 오류 발생:", file=sys.stderr)
