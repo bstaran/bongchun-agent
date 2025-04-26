@@ -381,6 +381,12 @@ class ChatGUI:
         )
         self.send_button.pack(side=tk.LEFT, padx=5)
 
+        # 새 채팅 시작 버튼
+        self.new_chat_button = tk.Button(
+            button_frame, text="새 채팅 시작", command=self._start_new_chat_handler
+        )
+        self.new_chat_button.pack(side=tk.LEFT, padx=5)
+
         # 음성 입력 버튼 (STT 서비스가 있을 경우)
         if self.stt_service:
             self.stt_button = tk.Button(
@@ -500,6 +506,35 @@ class ChatGUI:
             print("음성 입력 단축키: STT 서비스 비활성화 또는 버튼 비활성 상태")
         return "break"
 
+    def _start_new_chat(self):
+        """새로운 채팅 세션을 시작하고 GUI를 초기화합니다."""
+        if not self.mcp_client or not self.mcp_client.gemini_model:
+            messagebox.showerror(
+                "오류", "MCP 클라이언트 또는 Gemini 모델이 초기화되지 않았습니다."
+            )
+            return False
+
+        try:
+            self.mcp_client.chat_session = self.mcp_client.gemini_model.start_chat(
+                enable_automatic_function_calling=True
+            )
+            self.response_area.config(state=tk.NORMAL)
+            self.response_area.delete("1.0", tk.END)
+            self.response_area.config(state=tk.DISABLED)
+            print("새로운 채팅 세션 시작됨.")
+            return True
+        except Exception as e:
+            error_msg = f"새로운 채팅 세션을 시작하는 데 실패했습니다: {e}"
+            print(f"오류: {error_msg}")
+            traceback.print_exc()
+            messagebox.showerror("오류", error_msg)
+            return False
+
+    def _start_new_chat_handler(self):
+        """새 채팅 시작 버튼 클릭 시 호출될 핸들러"""
+        print("새 채팅 시작 버튼 클릭됨")
+        self._start_new_chat()
+
     async def _process_ai_query(self, query, prompt_content):
         """비동기로 AI 쿼리 처리 (프롬프트 내용 포함)"""
         try:
@@ -553,12 +588,14 @@ class ChatGUI:
         self.send_button.config(state=tk.DISABLED)
         if self.stt_button:
             self.stt_button.config(state=tk.DISABLED)
+        self.new_chat_button.config(state=tk.DISABLED)
 
     def _enable_buttons(self):
         """입력 버튼 활성화"""
         self.send_button.config(state=tk.NORMAL)
         if self.stt_button:
             self.stt_button.config(state=tk.NORMAL)
+        self.new_chat_button.config(state=tk.NORMAL)
 
     def _on_closing(self):
         """창 닫기 버튼 클릭 시 호출될 함수"""
