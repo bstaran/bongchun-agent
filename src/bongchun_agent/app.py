@@ -31,9 +31,6 @@ except RuntimeError as e:
     print(f"STT 서비스 초기화 실패: {e}")
     sys.exit(1)
 
-
-# CLI 인자 파싱 함수 제거됨
-
 load_dotenv()
 
 try:
@@ -131,7 +128,7 @@ try:
         )
 
     whisper_device_pref = os.getenv("WHISPER_DEVICE", "auto").lower()
-    if whisper_device_pref not in ["auto", "cpu", "mps"]:
+    if whisper_device_pref not in ["auto", "cpu", "mps", "cuda"]:
         print(
             f"경고: WHISPER_DEVICE 환경 변수 값 '{whisper_device_pref}'이(가) 유효하지 않습니다. 'auto' 설정을 사용합니다."
         )
@@ -190,19 +187,16 @@ class ChatGUI:
         self.attached_file_path = None  # 첨부 파일 경로 저장 변수
         self.attached_file_label = None  # 첨부 파일 표시 레이블
 
-        # --- 프롬프트 관련 변수 ---
         self.prompt_dir = "prompt"
         self.available_prompts = self._load_prompts()
         self.prompt_var = tk.StringVar(self.root)
         self.selected_prompt_content = ""
         self.default_prompt_path = os.path.join(self.prompt_dir, "default.txt")
 
-        # --- 서비스 초기화 ---
         self._initialize_services()
         self._create_widgets()
         self._check_queue()
 
-        # 초기 프롬프트 로드
         if self.available_prompts:
             self.prompt_var.set(self.available_prompts[0])
             self._load_selected_prompt_content()
@@ -507,9 +501,10 @@ class ChatGUI:
             self.recording_status_label.lift()
         self._disable_buttons()
 
-        threading.Thread(target=self._run_stt_in_thread, daemon=True).start()
+        prompt_content = self.selected_prompt_content 
+        threading.Thread(target=self._run_stt_in_thread, args=(prompt_content,), daemon=True).start()
 
-    def _run_stt_in_thread(self):
+    def _run_stt_in_thread(self, prompt_content):
         """STT 작업을 별도 스레드에서 실행"""
         try:
             audio_data = self.stt_service.record_audio()

@@ -49,7 +49,7 @@ class STTService:
         Args:
             provider (str): 사용할 STT 제공자 ('whisper' 또는 'google')
             whisper_model_name (str): Whisper 사용 시 모델 이름 또는 경로
-            whisper_device_preference (str): Whisper 사용 시 장치 설정 ('auto', 'cpu', 'mps')
+            whisper_device_preference (str): Whisper 사용 시 장치 설정 ('auto', 'cpu', 'mps', 'cuda')
             google_lang_code (str): Google Cloud STT 사용 시 언어 코드
         """
         self.provider = provider
@@ -91,10 +91,19 @@ class STTService:
         )
         device = "cpu"
 
-        if self.device_preference == "cpu":
+        if self.whisper_device_preference == "cpu":
             print("사용자 설정에 따라 CPU를 사용합니다.")
             device = "cpu"
-        elif self.device_preference == "mps":
+        elif self.whisper_device_preference == "cuda":
+            if torch.cuda.is_available():
+                print("사용자 설정 'cuda' 확인됨. CUDA GPU를 사용합니다.")
+                device = "cuda"
+            else:
+                print(
+                    "경고: 사용자 설정 'cuda'이지만 CUDA를 사용할 수 없습니다. CPU로 fallback합니다."
+                )
+                device = "cpu"
+        elif self.whisper_device_preference == "mps":
             if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 print("사용자 설정 'mps' 확인됨. MPS (Apple Silicon GPU)를 사용합니다.")
                 device = "mps"
@@ -103,20 +112,22 @@ class STTService:
                     "경고: 사용자 설정 'mps'이지만 MPS를 사용할 수 없습니다. CPU로 fallback합니다."
                 )
                 device = "cpu"
-        elif self.device_preference == "auto":
-            # 자동 감지 로직 (MPS 우선)
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        elif self.whisper_device_preference == "auto":
+            # 자동 감지 로직 (CUDA > MPS > CPU 우선)
+            if torch.cuda.is_available():
+                print("자동 감지: CUDA GPU 사용 가능. 장치를 'cuda'로 설정합니다.")
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 print(
-                    "자동 감지: MPS (Apple Silicon GPU) 사용 가능. 장치를 'mps'로 설정합니다."
+                    "자동 감지: CUDA 사용 불가, MPS (Apple Silicon GPU) 사용 가능. 장치를 'mps'로 설정합니다."
                 )
                 device = "mps"
-            #     device = "cuda"
             else:
-                print("자동 감지: MPS/CUDA 사용 불가. CPU를 사용합니다.")
+                print("자동 감지: CUDA/MPS 사용 불가. CPU를 사용합니다.")
                 device = "cpu"
 
         print(
-            f"실제 WhisperModel 로드 시도 모델: '{self.model_name}', 장치: '{device}'"
+            f"실제 WhisperModel 로드 시도 모델: '{self.whisper_model_name}', 장치: '{device}'"
         )
         try:
             self.whisper_model = WhisperModel(
@@ -248,13 +259,12 @@ class STTService:
         """NumPy float32 오디오 데이터를 WAV 형식의 바이트 스트림으로 변환"""
         if audio_data_np is None or audio_data_np.size == 0:
             return b""
-        # float32 [-1.0, 1.0] -> int16 [-32768, 32767]
         audio_data_int16 = (audio_data_np * 32767).astype(np.int16)
 
         bytes_io = io.BytesIO()
         with wave.open(bytes_io, "wb") as wf:
-            wf.setnchannels(1)  # Mono
-            wf.setsampwidth(2)  # 16-bit = 2 bytes
+            wf.setnchannels(1) 
+            wf.setsampwidth(2) 
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(audio_data_int16.tobytes())
         return bytes_io.getvalue()
