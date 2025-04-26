@@ -123,7 +123,7 @@ class STTService:
                 self.whisper_model_name,
                 device=device,
                 compute_type="int8",
-                download_root="./models",
+                download_root="../models",
             )
             self.whisper_device = device
 
