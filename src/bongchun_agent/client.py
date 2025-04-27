@@ -2,21 +2,30 @@ import asyncio
 import os
 import json
 import traceback
+import mimetypes
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 from contextlib import AsyncExitStack
+
+# Pillow 라이브러리 임포트 시도, 없으면 오류 메시지 출력
+try:
+    from PIL import Image, UnidentifiedImageError
+except ImportError:
+    print("경고: Pillow 라이브러리가 설치되지 않았습니다. 이미지 처리가 불가능합니다.")
+    print("pip install Pillow")
+    Image = None
+    UnidentifiedImageError = None
+
 
 from mcp import ClientSession, StdioServerParameters, types as mcp_types
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
 
-import google.generativeai as genai
-from google.generativeai.types import (
-    Tool,
-    FunctionDeclaration,
-    GenerationConfig,
-)
+import google.genai as genai
+from google.genai import types
+from google.genai.types import Tool, FunctionDeclaration, GenerationConfig
 
-from google.generativeai.protos import FunctionResponse
+from google.genai.types import FunctionResponse
 
 
 class MultiMCPClient:
@@ -33,18 +42,30 @@ class MultiMCPClient:
         self.tool_to_server_map: Dict[str, str] = {}
 
         try:
-            self.gemini_model = genai.GenerativeModel(
-                model_name=model_name,
-                safety_settings=safety_settings,
-                generation_config=generation_config,
-                system_instruction=system_instruction,
+            # API 키는 환경 변수 GOOGLE_API_KEY 또는 Vertex AI 설정에서 자동으로 로드됨
+            # 또는 명시적으로 api_key=os.getenv("GOOGLE_API_KEY") 등을 추가할 수 있음
+            self.gemini_client = genai.Client()  # Client 객체 생성
+            print(f"✅ Gemini 클라이언트 초기화 완료.")
+            self.model_name = model_name  # 모델 이름 저장
+            self.safety_settings = safety_settings  # 안전 설정 저장
+            self.generation_config = generation_config  # 생성 설정 저장
+            self.system_instruction = system_instruction  # 시스템 명령어 저장
+
+            # 채팅 세션 생성 (mhtml 라인 2115 참고)
+            # system_instruction 등은 send_message 시 전달해야 할 수 있음
+            self.chat_session = self.gemini_client.chats.create(
+                model=f"models/{self.model_name}",  # 저장된 모델 이름 사용 (models/ 접두사 추가)
+                history=[],  # 초기 history는 비움
             )
-            self.chat_session = self.gemini_model.start_chat(
-                enable_automatic_function_calling=True
-            )
-            print(f"✅ Gemini 모델 '{model_name}' 초기화 완료.")
+            print(f"✅ Gemini 채팅 세션 시작 완료 (모델: {self.model_name}).")
+        except AttributeError as ae:
+            # genai.Client()가 없을 경우를 대비한 예외 처리 (라이브러리 버전 문제 등)
+            print(f"❌ Gemini 클라이언트 생성 중 속성 오류 발생: {ae}")
+            print("   google-generativeai 라이브러리가 최신 버전인지 확인하세요.")
+            raise
         except Exception as e:
-            print(f"❌ Gemini 모델 초기화 실패: {e}")
+            print(f"❌ Gemini 클라이언트 또는 채팅 세션 초기화 실패: {e}")
+            traceback.print_exc()  # 상세 오류 출력
             raise
 
     # MultiMCPClient 클래스 내부에 추가될 헬퍼 함수
@@ -64,14 +85,6 @@ class MultiMCPClient:
             return None
 
         cleaned_schema = {}
-        ALLOWED_FIELDS = {
-            "type",
-            "description",
-            "properties",
-            "required",
-            "enum",
-            "items",
-        }
         VALID_JSON_SCHEMA_TYPES = {
             "string",
             "number",
@@ -317,11 +330,15 @@ class MultiMCPClient:
         )
 
     async def process_query(
-        self, query: str, prompt_content: Optional[str] = None
+        self,
+        query: str,
+        prompt_content: Optional[str] = None,
+        file_path: Optional[str] = None,
     ) -> str:
         """
-        사용자 쿼리를 처리하고, 필요시 올바른 MCP 서버의 도구를 호출합니다.
-        prompt_content가 제공되면 이를 쿼리 앞에 추가하여 컨텍스트를 제공합니다.
+        사용자 쿼리와 선택적 파일 첨부를 처리하고, 필요시 MCP 도구를 호출합니다.
+        prompt_content가 제공되면 쿼리 앞에 추가됩니다.
+        file_path가 제공되고 이미지 파일이면 멀티모달 요청으로 처리합니다.
         """
         if not self.sessions:
             print("경고: 연결된 MCP 서버가 없습니다. 도구 사용이 제한됩니다.")
@@ -338,9 +355,233 @@ class MultiMCPClient:
         print("\nGemini 모델에게 요청 전송 중...")
         gemini_tools = self._mcp_tools_to_gemini_tools()
 
+        # --- 이미지 처리 로직 시작 ---
+        image_part = None
+        print(
+            f"[DEBUG] 이미지 처리 시작. file_path: {file_path}, Pillow 사용 가능: {bool(Image)}"
+        )
+        if file_path and Image:  # Pillow가 설치되었는지 확인
+            try:
+                p = Path(file_path)
+                print(f"[DEBUG] 파일 경로 객체 생성: {p}")
+                if p.is_file():
+                    print(f"[DEBUG] 파일 존재 확인: {file_path}")
+                    mime_type, _ = mimetypes.guess_type(p)
+                    print(f"[DEBUG] MIME 타입 확인: {mime_type} for {file_path}")
+                    if mime_type and mime_type.startswith("image/"):
+                        print(f"[DEBUG] 이미지 파일 MIME 타입 확인됨: {mime_type}")
+                        try:
+                            print(f"[DEBUG] Pillow로 이미지 열기 시도: {file_path}")
+                            img = Image.open(p)
+                            img.verify()  # 이미지 유효성 검사 추가
+                            # verify() 후 파일을 다시 열어야 할 수 있음
+                            img = Image.open(p)
+                            print(
+                                f"[DEBUG] Pillow로 이미지 열기 성공: {file_path}, Format: {img.format}, Size: {img.size}"
+                            )
+                        except UnidentifiedImageError:
+                            print(
+                                f"[DEBUG] 오류: Pillow가 이미지 파일을 식별할 수 없음: {file_path}"
+                            )
+                            raise  # 예외를 다시 발생시켜 아래 except 블록에서 처리
+                        except Exception as img_err:
+                            print(
+                                f"[DEBUG] 오류: Pillow 이미지 처리 중 오류 발생: {img_err}"
+                            )
+                            raise  # 예외를 다시 발생시켜 아래 except 블록에서 처리
+
+                        try:
+                            print(
+                                f"[DEBUG] types.Part.from_data 생성 시도: {file_path}"
+                            )
+                            image_part = types.Part.from_bytes(  # from_data -> from_bytes 로 수정
+                                mime_type=mime_type,
+                                data=p.read_bytes(),  # 파일 내용을 바이트로 읽음
+                            )
+                            print(
+                                f"[DEBUG] types.Part.from_bytes 생성 성공. MimeType: {mime_type}, Data Length: {len(image_part.data) if hasattr(image_part, 'data') else 'N/A'}"  # 로그 메시지 수정 및 image_part.mime_type -> mime_type
+                            )
+                        except Exception as part_err:
+                            print(
+                                f"[DEBUG] 오류: types.Part.from_data 생성 중 오류 발생: {part_err}"
+                            )
+                            raise  # 예외를 다시 발생시켜 아래 except 블록에서 처리
+
+                        print("[DEBUG] 이미지 데이터를 Gemini 요청에 포함 준비 완료.")
+                    else:
+                        print(
+                            f"[DEBUG] 경고: 첨부된 파일 '{file_path}'은(는) 이미지 파일이 아닙니다 (MIME: {mime_type}). 텍스트 요청만 보냅니다."
+                        )
+                else:
+                    print(
+                        f"[DEBUG] 경고: 첨부된 파일 경로 '{file_path}'을(를) 찾을 수 없거나 파일이 아닙니다."
+                    )
+            except FileNotFoundError:
+                print(
+                    f"[DEBUG] 오류: 첨부된 이미지 파일 '{file_path}'을(를) 찾을 수 없습니다."
+                )
+                return f"오류: 첨부 파일 '{file_path}'을(를) 찾을 수 없습니다."
+            except UnidentifiedImageError:
+                # 위에서 이미 로깅되었으므로 여기서는 간단히 처리
+                print(f"[DEBUG] 오류 처리: UnidentifiedImageError for {file_path}")
+                return f"오류: 첨부 파일 '{file_path}'은(는) 유효한 이미지 파일이 아닙니다."
+            except IOError as e:
+                print(f"[DEBUG] 오류 처리: IOError for {file_path}: {e}")
+                return f"오류: 첨부 파일 '{file_path}' 처리 중 IO 오류 발생: {e}"
+            except Exception as e:
+                print(f"[DEBUG] 오류 처리: 예기치 않은 오류 for {file_path}: {e}")
+                traceback.print_exc()
+                return f"오류: 첨부 파일 처리 중 예기치 않은 오류 발생: {e}"
+        elif file_path and not Image:
+            print(
+                "[DEBUG] 경고: Pillow 라이브러리가 없어 이미지 파일을 처리할 수 없습니다. 텍스트 요청만 보냅니다."
+            )
+        else:
+            print(
+                "[DEBUG] 이미지 파일 경로가 제공되지 않았거나 Pillow 라이브러리가 없습니다. 이미지 처리 건너<0xEB><0x9C><0x9C>니다."
+            )
+        # --- 이미지 처리 로직 끝 ---
+
+        processed_image_info = None  # (image_part, mime_type) 저장용 튜플
         try:
-            response = await self.chat_session.send_message_async(
-                full_query, tools=gemini_tools
+            # --- 이미지 처리 로직 시작 (processed_image_info 설정) ---
+            # 이 블록은 image_part와 mime_type을 알아내고 processed_image_info에 저장합니다.
+            # (기존 이미지 처리 코드는 여기에 위치하며, 성공 시 processed_image_info = (image_part, mime_type) 설정)
+            # --- 이미지 처리 로직 시작 ---
+            print(
+                f"[DEBUG] 이미지 처리 시작. file_path: {file_path}, Pillow 사용 가능: {bool(Image)}"
+            )
+            if file_path and Image:  # Pillow가 설치되었는지 확인
+                try:
+                    p = Path(file_path)
+                    print(f"[DEBUG] 파일 경로 객체 생성: {p}")
+                    if p.is_file():
+                        print(f"[DEBUG] 파일 존재 확인: {file_path}")
+                        mime_type, _ = mimetypes.guess_type(p)
+                        print(f"[DEBUG] MIME 타입 확인: {mime_type} for {file_path}")
+                        if mime_type and mime_type.startswith("image/"):
+                            print(f"[DEBUG] 이미지 파일 MIME 타입 확인됨: {mime_type}")
+                            try:
+                                print(f"[DEBUG] Pillow로 이미지 열기 시도: {file_path}")
+                                img = Image.open(p)
+                                img.verify()  # 이미지 유효성 검사 추가
+                                # verify() 후 파일을 다시 열어야 할 수 있음
+                                img = Image.open(p)
+                                print(
+                                    f"[DEBUG] Pillow로 이미지 열기 성공: {file_path}, Format: {img.format}, Size: {img.size}"
+                                )
+                            except UnidentifiedImageError:
+                                print(
+                                    f"[DEBUG] 오류: Pillow가 이미지 파일을 식별할 수 없음: {file_path}"
+                                )
+                                raise  # 예외를 다시 발생시켜 아래 except 블록에서 처리
+                            except Exception as img_err:
+                                print(
+                                    f"[DEBUG] 오류: Pillow 이미지 처리 중 오류 발생: {img_err}"
+                                )
+                                raise  # 예외를 다시 발생시켜 아래 except 블록에서 처리
+
+                            try:
+                                print(
+                                    f"[DEBUG] types.Part.from_bytes 생성 시도: {file_path}"
+                                )
+                                image_part = types.Part.from_bytes(
+                                    mime_type=mime_type,
+                                    data=p.read_bytes(),  # 파일 내용을 바이트로 읽음
+                                )
+                                processed_image_info = (
+                                    image_part,
+                                    mime_type,
+                                )  # 튜플로 저장
+                                print(
+                                    f"[DEBUG] types.Part.from_bytes 생성 성공. MimeType: {mime_type}"
+                                )
+                            except Exception as part_err:
+                                print(
+                                    f"[DEBUG] 오류: types.Part.from_bytes 생성 중 오류 발생: {part_err}"
+                                )
+                                raise  # 예외를 다시 발생시켜 아래 except 블록에서 처리
+
+                            print(
+                                "[DEBUG] 이미지 데이터를 Gemini 요청에 포함 준비 완료."
+                            )
+                        else:
+                            print(
+                                f"[DEBUG] 경고: 첨부된 파일 '{file_path}'은(는) 이미지 파일이 아닙니다 (MIME: {mime_type}). 텍스트 요청만 보냅니다."
+                            )
+                    else:
+                        print(
+                            f"[DEBUG] 경고: 첨부된 파일 경로 '{file_path}'을(를) 찾을 수 없거나 파일이 아닙니다."
+                        )
+                except FileNotFoundError:
+                    print(
+                        f"[DEBUG] 오류: 첨부된 이미지 파일 '{file_path}'을(를) 찾을 수 없습니다."
+                    )
+                    return f"오류: 첨부 파일 '{file_path}'을(를) 찾을 수 없습니다."
+                except UnidentifiedImageError:
+                    # 위에서 이미 로깅되었으므로 여기서는 간단히 처리
+                    print(f"[DEBUG] 오류 처리: UnidentifiedImageError for {file_path}")
+                    return f"오류: 첨부 파일 '{file_path}'은(는) 유효한 이미지 파일이 아닙니다."
+                except IOError as e:
+                    print(f"[DEBUG] 오류 처리: IOError for {file_path}: {e}")
+                    return f"오류: 첨부 파일 '{file_path}' 처리 중 IO 오류 발생: {e}"
+                except Exception as e:
+                    print(f"[DEBUG] 오류 처리: 예기치 않은 오류 for {file_path}: {e}")
+                    traceback.print_exc()
+                    return f"오류: 첨부 파일 처리 중 예기치 않은 오류 발생: {e}"
+            elif file_path and not Image:
+                print(
+                    "[DEBUG] 경고: Pillow 라이브러리가 없어 이미지 파일을 처리할 수 없습니다. 텍스트 요청만 보냅니다."
+                )
+            else:
+                print(
+                    "[DEBUG] 이미지 파일 경로가 제공되지 않았거나 Pillow 라이브러리가 없습니다. 이미지 처리 건너<0xEB><0x9C><0x9C>니다."
+                )
+            # --- 이미지 처리 로직 끝 ---
+
+            # --- 요청 내용 구성 및 로깅 시작 ---
+            request_content_parts = [full_query]  # API 전달용 리스트
+            log_data_items = [{"type": "text", "content": full_query}]  # 로깅용 리스트
+
+            if processed_image_info:
+                image_part_obj, image_mime_type = processed_image_info
+                request_content_parts.append(image_part_obj)
+                log_data_items.append(
+                    {
+                        "type": "image",
+                        "mime_type": image_mime_type,  # 저장된 mime_type 사용
+                        "data_length": (
+                            len(image_part_obj.data)
+                            if hasattr(image_part_obj, "data")
+                            else "N/A"
+                        ),
+                    }
+                )
+                print("[DEBUG] Sending multimodal request (text + image)")
+            else:
+                print("[DEBUG] Sending text-only request")
+
+            # API 요청 데이터 로깅
+            print(
+                f"API 요청 데이터: {json.dumps(log_data_items, indent=2, ensure_ascii=False)}"
+            )
+            # --- 요청 내용 구성 및 로깅 끝 ---
+
+            # Gemini API 호출
+            # send_message 호출 시 전달할 인자 구성 (send_message는 content 외 인자 안 받음)
+            send_args = {}  # 빈 딕셔너리로 초기화
+
+            # generation_config, safety_settings, tools 등은 ChatSession 생성 시점에
+            # 또는 generate_content 메서드의 config 인자를 통해 적용되어야 함.
+            # send_message 호출 시에는 전달하지 않음.
+
+            print(
+                f"[DEBUG] Preparing arguments for send_message (should be empty): {send_args}"
+            )
+
+            # send_message 호출 시 request_content_parts만 전달하고, 빈 send_args 전달
+            response = self.chat_session.send_message(
+                request_content_parts, **send_args
             )
 
             final_text_parts = []

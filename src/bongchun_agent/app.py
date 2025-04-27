@@ -1,14 +1,15 @@
 import os
 import sys
-import google.generativeai as genai
+import google.genai as genai
 import json
 import asyncio
 import traceback
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, ttk
+from tkinter import scrolledtext, messagebox, ttk, filedialog
 import threading
 import queue
 import platform
+from typing import Optional
 
 try:
     from pynput import keyboard
@@ -41,7 +42,7 @@ try:
         raise ValueError(
             "환경 변수 'GOOGLE_API_KEY'가 설정되지 않았거나 유효하지 않습니다. .env 파일을 확인하세요."
         )
-    genai.configure(api_key=google_api_key)
+    genai.Client(api_key=google_api_key)
 
     model_name = os.getenv("MODEL_NAME")
     if not model_name:
@@ -186,6 +187,8 @@ class ChatGUI:
         self.response_queue = queue.Queue()
         self.hotkey_listener = None
         self.recording_status_label = None
+        self.attached_file_path = None  # 첨부 파일 경로 저장 변수
+        self.attached_file_label = None  # 첨부 파일 표시 레이블
 
         # --- 프롬프트 관련 변수 ---
         self.prompt_dir = "prompt"
@@ -396,6 +399,12 @@ class ChatGUI:
         else:
             self.stt_button = None
 
+        # 파일 첨부 버튼
+        self.attach_button = tk.Button(
+            button_frame, text="파일 첨부", command=self._attach_file_handler
+        )
+        self.attach_button.pack(side=tk.LEFT, padx=5)
+
         # 답변 출력 영역
         response_label = tk.Label(self.root, text="Response:")
         response_label.pack(pady=(10, 0), padx=10, anchor=tk.W)
@@ -412,6 +421,12 @@ class ChatGUI:
             self.root, text="", fg="red", font=("Helvetica", 10)
         )
         self.recording_status_label.pack_forget()
+
+        # 첨부 파일 표시 레이블
+        self.attached_file_label = tk.Label(
+            self.root, text="", fg="blue", font=("Helvetica", 9)
+        )
+        self.attached_file_label.pack(pady=(0, 5), padx=10, anchor=tk.W)
 
     def _insert_newline(self, event):
         """Shift+Enter 입력 시 줄바꿈 삽입 (request_entry에 적용)"""
@@ -447,11 +462,36 @@ class ChatGUI:
         self.request_entry.delete("1.0", tk.END)
         self._disable_buttons()
 
+        # 현재 첨부된 파일 경로를 가져옴
+        current_file_path = self.attached_file_path
+
         asyncio.run_coroutine_threadsafe(
-            self._process_ai_query(user_request, self.selected_prompt_content),
+            self._process_ai_query(
+                user_request, self.selected_prompt_content, file_path=current_file_path
+            ),
             self.loop,
         )
         return "break"
+
+    def _attach_file_handler(self):
+        """파일 첨부 버튼 클릭 시 호출될 핸들러"""
+        filetypes = (
+            ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp"),
+            ("All files", "*.*"),
+        )
+        filepath = filedialog.askopenfilename(
+            title="이미지 파일 선택", filetypes=filetypes
+        )
+        if filepath:
+            self.attached_file_path = filepath
+            filename = os.path.basename(filepath)
+            self.attached_file_label.config(text=f"첨부됨: {filename}")
+            print(f"파일 첨부됨: {self.attached_file_path}")
+        else:
+            # 파일 선택 취소 시 기존 첨부 정보 유지 또는 초기화 (선택)
+            # self.attached_file_path = None
+            # self.attached_file_label.config(text="")
+            print("파일 선택 취소됨.")
 
     def _voice_input_handler(self):
         """음성 입력 버튼 클릭 시 호출될 핸들러"""
@@ -477,8 +517,15 @@ class ChatGUI:
                 user_input = self.stt_service.transcribe_audio(audio_data)
                 if user_input:
                     self.response_queue.put(f"Voice Input Recognized: {user_input}")
+                    # 현재 첨부된 파일 경로를 가져옴
+                    current_file_path = self.attached_file_path
                     asyncio.run_coroutine_threadsafe(
-                        self._process_ai_query(user_input), self.loop
+                        self._process_ai_query(
+                            user_input,
+                            self.selected_prompt_content,  # 음성 입력 시에도 현재 선택된 프롬프트 사용
+                            file_path=current_file_path,
+                        ),
+                        self.loop,
                     )
                 else:
                     self.response_queue.put("System: 음성을 인식하지 못했습니다.")
@@ -508,20 +555,24 @@ class ChatGUI:
 
     def _start_new_chat(self):
         """새로운 채팅 세션을 시작하고 GUI를 초기화합니다."""
-        if not self.mcp_client or not self.mcp_client.gemini_model:
+        if not self.mcp_client or not self.mcp_client.gemini_client:
             messagebox.showerror(
-                "오류", "MCP 클라이언트 또는 Gemini 모델이 초기화되지 않았습니다."
+                "오류", "MCP 클라이언트 또는 Gemini 클라이언트가 초기화되지 않았습니다."
             )
             return False
 
         try:
-            self.mcp_client.chat_session = self.mcp_client.gemini_model.start_chat(
-                enable_automatic_function_calling=True
+            # 새 채팅 세션 생성 (client.py의 __init__과 동일한 방식으로)
+            self.mcp_client.chat_session = self.mcp_client.gemini_client.chats.create(
+                model=f"models/{self.mcp_client.model_name}",
+                history=[],  # 새 채팅이므로 history 초기화
             )
             self.response_area.config(state=tk.NORMAL)
             self.response_area.delete("1.0", tk.END)
             self.response_area.config(state=tk.DISABLED)
-            print("새로운 채팅 세션 시작됨.")
+            self.attached_file_path = None  # 새 채팅 시 첨부 파일 초기화
+            self.attached_file_label.config(text="")  # 새 채팅 시 레이블 초기화
+            print("새로운 채팅 세션 시작됨 (첨부 파일 초기화됨).")
             return True
         except Exception as e:
             error_msg = f"새로운 채팅 세션을 시작하는 데 실패했습니다: {e}"
@@ -535,18 +586,24 @@ class ChatGUI:
         print("새 채팅 시작 버튼 클릭됨")
         self._start_new_chat()
 
-    async def _process_ai_query(self, query, prompt_content):
-        """비동기로 AI 쿼리 처리 (프롬프트 내용 포함)"""
+    async def _process_ai_query(
+        self, query: str, prompt_content: str, file_path: Optional[str] = None
+    ):
+        """비동기로 AI 쿼리 처리 (프롬프트 내용 및 파일 경로 포함)"""
         try:
             self.response_queue.put("System: AI 처리 중...")
             ai_response = await self.mcp_client.process_query(
-                query, prompt_content=prompt_content
+                query, prompt_content=prompt_content, file_path=file_path
             )
             self.response_queue.put(f"AI: {ai_response}")
         except Exception as e:
             self.response_queue.put(f"System: AI 처리 중 오류 발생: {e}")
             traceback.print_exc()
         finally:
+            # AI 처리 후 첨부 파일 정보 초기화
+            self.attached_file_path = None
+            # GUI 업데이트는 메인 스레드에서 안전하게 처리하도록 큐에 메시지 전달
+            self.response_queue.put("System: Clear attachment label")
             self.response_queue.put("System: Buttons enabled")
 
     def _display_response(self, text):
@@ -574,6 +631,9 @@ class ChatGUI:
                 elif message == "System: Hide recording status":
                     if self.recording_status_label:
                         self.recording_status_label.pack_forget()
+                elif message == "System: Clear attachment label":
+                    if self.attached_file_label:
+                        self.attached_file_label.config(text="")
                 elif isinstance(message, str) and not message.startswith("System:"):
                     self._display_response(message)
                 elif isinstance(message, str):
@@ -589,6 +649,7 @@ class ChatGUI:
         if self.stt_button:
             self.stt_button.config(state=tk.DISABLED)
         self.new_chat_button.config(state=tk.DISABLED)
+        self.attach_button.config(state=tk.DISABLED)  # 파일 첨부 버튼 비활성화
 
     def _enable_buttons(self):
         """입력 버튼 활성화"""
@@ -596,6 +657,7 @@ class ChatGUI:
         if self.stt_button:
             self.stt_button.config(state=tk.NORMAL)
         self.new_chat_button.config(state=tk.NORMAL)
+        self.attach_button.config(state=tk.NORMAL)  # 파일 첨부 버튼 활성화
 
     def _on_closing(self):
         """창 닫기 버튼 클릭 시 호출될 함수"""
