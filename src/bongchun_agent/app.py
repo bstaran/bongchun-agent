@@ -184,8 +184,8 @@ class ChatGUI:
         self.response_queue = queue.Queue()
         self.hotkey_listener = None
         self.recording_status_label = None
-        self.attached_file_path = None  # 첨부 파일 경로 저장 변수
-        self.attached_file_label = None  # 첨부 파일 표시 레이블
+        self.attached_file_path = None
+        self.attached_file_label = None
 
         self.prompt_dir = "prompt"
         self.available_prompts = self._load_prompts()
@@ -482,9 +482,6 @@ class ChatGUI:
             self.attached_file_label.config(text=f"첨부됨: {filename}")
             print(f"파일 첨부됨: {self.attached_file_path}")
         else:
-            # 파일 선택 취소 시 기존 첨부 정보 유지 또는 초기화 (선택)
-            # self.attached_file_path = None
-            # self.attached_file_label.config(text="")
             print("파일 선택 취소됨.")
 
     def _voice_input_handler(self):
@@ -501,8 +498,10 @@ class ChatGUI:
             self.recording_status_label.lift()
         self._disable_buttons()
 
-        prompt_content = self.selected_prompt_content 
-        threading.Thread(target=self._run_stt_in_thread, args=(prompt_content,), daemon=True).start()
+        prompt_content = self.selected_prompt_content
+        threading.Thread(
+            target=self._run_stt_in_thread, args=(prompt_content,), daemon=True
+        ).start()
 
     def _run_stt_in_thread(self, prompt_content):
         """STT 작업을 별도 스레드에서 실행"""
@@ -512,12 +511,11 @@ class ChatGUI:
                 user_input = self.stt_service.transcribe_audio(audio_data)
                 if user_input:
                     self.response_queue.put(f"Voice Input Recognized: {user_input}")
-                    # 현재 첨부된 파일 경로를 가져옴
                     current_file_path = self.attached_file_path
                     asyncio.run_coroutine_threadsafe(
                         self._process_ai_query(
                             user_input,
-                            self.selected_prompt_content,  # 음성 입력 시에도 현재 선택된 프롬프트 사용
+                            self.selected_prompt_content,
                             file_path=current_file_path,
                         ),
                         self.loop,
@@ -557,16 +555,15 @@ class ChatGUI:
             return False
 
         try:
-            # 새 채팅 세션 생성 (client.py의 __init__과 동일한 방식으로)
             self.mcp_client.chat_session = self.mcp_client.gemini_client.chats.create(
                 model=f"models/{self.mcp_client.model_name}",
-                history=[],  # 새 채팅이므로 history 초기화
+                history=[],
             )
             self.response_area.config(state=tk.NORMAL)
             self.response_area.delete("1.0", tk.END)
             self.response_area.config(state=tk.DISABLED)
-            self.attached_file_path = None  # 새 채팅 시 첨부 파일 초기화
-            self.attached_file_label.config(text="")  # 새 채팅 시 레이블 초기화
+            self.attached_file_path = None
+            self.attached_file_label.config(text="")
             print("새로운 채팅 세션 시작됨 (첨부 파일 초기화됨).")
             return True
         except Exception as e:
@@ -595,9 +592,7 @@ class ChatGUI:
             self.response_queue.put(f"System: AI 처리 중 오류 발생: {e}")
             traceback.print_exc()
         finally:
-            # AI 처리 후 첨부 파일 정보 초기화
             self.attached_file_path = None
-            # GUI 업데이트는 메인 스레드에서 안전하게 처리하도록 큐에 메시지 전달
             self.response_queue.put("System: Clear attachment label")
             self.response_queue.put("System: Buttons enabled")
 
@@ -644,7 +639,7 @@ class ChatGUI:
         if self.stt_button:
             self.stt_button.config(state=tk.DISABLED)
         self.new_chat_button.config(state=tk.DISABLED)
-        self.attach_button.config(state=tk.DISABLED)  # 파일 첨부 버튼 비활성화
+        self.attach_button.config(state=tk.DISABLED)
 
     def _enable_buttons(self):
         """입력 버튼 활성화"""
@@ -652,7 +647,7 @@ class ChatGUI:
         if self.stt_button:
             self.stt_button.config(state=tk.NORMAL)
         self.new_chat_button.config(state=tk.NORMAL)
-        self.attach_button.config(state=tk.NORMAL)  # 파일 첨부 버튼 활성화
+        self.attach_button.config(state=tk.NORMAL)
 
     def _on_closing(self):
         """창 닫기 버튼 클릭 시 호출될 함수"""
