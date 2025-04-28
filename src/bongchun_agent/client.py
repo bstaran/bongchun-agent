@@ -342,12 +342,12 @@ class MultiMCPClient:
         self,
         query: str,
         additional_prompt: Optional[str] = None,
-        file_path: Optional[str] = None,
+        file_paths: Optional[List[str]] = None,
     ) -> str:
         """
-        사용자 쿼리와 선택적 파일 첨부, 추가 프롬프트를 처리하고, 필요시 MCP 도구를 호출합니다.
+        사용자 쿼리와 선택적 파일 첨부(들), 추가 프롬프트를 처리하고, 필요시 MCP 도구를 호출합니다.
         additional_prompt가 제공되면 쿼리 앞에 추가됩니다.
-        file_path가 제공되고 이미지 파일이면 멀티모달 요청으로 처리합니다.
+        file_paths 리스트가 제공되고 첫 번째 파일이 이미지 파일이면 멀티모달 요청으로 처리합니다. (현재는 첫 파일만 지원)
         기본 시스템 프롬프트는 세션 생성 시 적용됩니다.
         """
         if not self.sessions:
@@ -368,35 +368,39 @@ class MultiMCPClient:
             print("\nGemini 모델에게 요청 전송 중...")
             gemini_tools = self._mcp_tools_to_gemini_tools()
 
-            # --- 이미지 처리 로직 시작 ---
             image_part = None
             mime_type = None
+            first_file_path = file_paths[0] if file_paths else None
             print(
-                f"[DEBUG] 이미지 처리 시작. file_path: {file_path}, Pillow 사용 가능: {bool(Image)}"
+                f"[DEBUG] 이미지 처리 시작. first_file_path: {first_file_path}, Pillow 사용 가능: {bool(Image)}"
             )
-            if file_path and Image:
+            if first_file_path and Image:
                 try:
-                    p = Path(file_path)
+                    p = Path(first_file_path)
                     print(f"[DEBUG] 파일 경로 객체 생성: {p}")
                     if p.is_file():
-                        print(f"[DEBUG] 파일 존재 확인: {file_path}")
+                        print(f"[DEBUG] 파일 존재 확인: {first_file_path}")
                         mime_type, _ = mimetypes.guess_type(p)
-                        print(f"[DEBUG] MIME 타입 확인: {mime_type} for {file_path}")
+                        print(
+                            f"[DEBUG] MIME 타입 확인: {mime_type} for {first_file_path}"
+                        )
                         if mime_type and mime_type.startswith("image/"):
                             print(f"[DEBUG] 이미지 파일 MIME 타입 확인됨: {mime_type}")
                             try:
-                                print(f"[DEBUG] Pillow로 이미지 열기 시도: {file_path}")
+                                print(
+                                    f"[DEBUG] Pillow로 이미지 열기 시도: {first_file_path}"
+                                )
                                 img = Image.open(p)
                                 img.verify()
                                 img.close()
                                 img = Image.open(p)
                                 print(
-                                    f"[DEBUG] Pillow로 이미지 열기 성공: {file_path}, Format: {img.format}, Size: {img.size}"
+                                    f"[DEBUG] Pillow로 이미지 열기 성공: {first_file_path}, Format: {img.format}, Size: {img.size}"
                                 )
                                 img.close()
                             except UnidentifiedImageError:
                                 print(
-                                    f"[DEBUG] 오류: Pillow가 이미지 파일을 식별할 수 없음: {file_path}"
+                                    f"[DEBUG] 오류: Pillow가 이미지 파일을 식별할 수 없음: {first_file_path}"
                                 )
                                 raise
                             except Exception as img_err:
@@ -407,7 +411,7 @@ class MultiMCPClient:
 
                             try:
                                 print(
-                                    f"[DEBUG] types.Part.from_data 생성 시도: {file_path}"
+                                    f"[DEBUG] types.Part.from_data 생성 시도: {first_file_path}"
                                 )
                                 image_part = types.Part.from_bytes(
                                     mime_type=mime_type,
@@ -427,30 +431,36 @@ class MultiMCPClient:
                             )
                         else:
                             print(
-                                f"[DEBUG] 경고: 첨부된 파일 '{file_path}'은(는) 이미지 파일이 아닙니다 (MIME: {mime_type}). 텍스트 요청만 보냅니다."
+                                f"[DEBUG] 경고: 첨부된 파일 '{first_file_path}'은(는) 이미지 파일이 아닙니다 (MIME: {mime_type}). 텍스트 요청만 보냅니다."
                             )
                     else:
                         print(
-                            f"[DEBUG] 경고: 첨부된 파일 경로 '{file_path}'을(를) 찾을 수 없거나 파일이 아닙니다."
+                            f"[DEBUG] 경고: 첨부된 파일 경로 '{first_file_path}'을(를) 찾을 수 없거나 파일이 아닙니다."
                         )
                 except FileNotFoundError:
                     print(
-                        f"[DEBUG] 오류: 첨부된 이미지 파일 '{file_path}'을(를) 찾을 수 없습니다."
+                        f"[DEBUG] 오류: 첨부된 이미지 파일 '{first_file_path}'을(를) 찾을 수 없습니다."
                     )
-                    return f"오류: 첨부 파일 '{file_path}'을(를) 찾을 수 없습니다."
+                    return (
+                        f"오류: 첨부 파일 '{first_file_path}'을(를) 찾을 수 없습니다."
+                    )
                 except UnidentifiedImageError:
-                    print(f"[DEBUG] 오류 처리: UnidentifiedImageError for {file_path}")
-                    return f"오류: 첨부 파일 '{file_path}'은(는) 유효한 이미지 파일이 아닙니다."
+                    print(
+                        f"[DEBUG] 오류 처리: UnidentifiedImageError for {first_file_path}"
+                    )
+                    return f"오류: 첨부 파일 '{first_file_path}'은(는) 유효한 이미지 파일이 아닙니다."
                 except IOError as e:
-                    print(f"[DEBUG] 오류 처리: IOError for {file_path}: {e}")
-                    return f"오류: 첨부 파일 '{file_path}' 처리 중 IO 오류 발생: {e}"
+                    print(f"[DEBUG] 오류 처리: IOError for {first_file_path}: {e}")
+                    return (
+                        f"오류: 첨부 파일 '{first_file_path}' 처리 중 IO 오류 발생: {e}"
+                    )
                 except Exception as e:
                     print(
-                        f"[DEBUG] 오류 처리: 예기치 않은 이미지 처리 오류 for {file_path}: {e}"
+                        f"[DEBUG] 오류 처리: 예기치 않은 이미지 처리 오류 for {first_file_path}: {e}"
                     )
                     traceback.print_exc()
                     return f"오류: 첨부 파일 처리 중 예기치 않은 오류 발생: {e}"
-            elif file_path and not Image:
+            elif first_file_path and not Image:
                 print(
                     "[DEBUG] 경고: Pillow 라이브러리가 없어 이미지 파일을 처리할 수 없습니다. 텍스트 요청만 보냅니다."
                 )
@@ -458,7 +468,6 @@ class MultiMCPClient:
                 print(
                     "[DEBUG] 이미지 파일 경로가 제공되지 않았거나 Pillow 라이브러리가 없습니다. 이미지 처리 건너뜁니다."
                 )
-            # --- 이미지 처리 로직 끝 ---
 
             request_content_parts = [full_query]
             log_data_items = [{"type": "text", "content": full_query}]

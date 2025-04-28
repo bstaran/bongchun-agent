@@ -2,13 +2,13 @@ import asyncio
 import traceback
 import queue
 import threading
-from typing import Optional, Any
+from typing import Optional
 import os
 
 from .client import MultiMCPClient
-from .app_config import load_config, NO_PROMPT_OPTION
 from .prompt_manager import PromptManager
 from .stt_service import STTService
+from .hotkey_manager import HotkeyManager
 
 from typing import TYPE_CHECKING
 
@@ -28,7 +28,7 @@ class AppController:
         self.config = config
         self.prompt_manager = prompt_manager
         self.response_queue = queue.Queue()
-        self.attached_file_path: Optional[str] = None
+        self.attached_files: list[str] = []
         self.model_name = self.config.get("model_name")
         self.safety_settings = self.config.get("safety_settings")
         self.generation_config = self.config.get("generation_config")
@@ -39,6 +39,7 @@ class AppController:
 
         self.mcp_client: Optional[MultiMCPClient] = None
         self.stt_service: Optional[STTService] = None
+        self.hotkey_manager: Optional[HotkeyManager] = None
 
         self._initialize_services()
 
@@ -47,7 +48,7 @@ class AppController:
             asyncio.run_coroutine_threadsafe(self._connect_mcp_servers(), self.loop)
 
     def set_gui(self, gui: "ChatGUI"):
-        """ChatGUI 인스턴스를 설정합니다."""
+        """ChatGUI 인스턴스를 설정하고 단축키 리스너를 시작합니다."""
         self.gui = gui
         print("AppController: GUI 참조 설정 완료.")
         if self.mcp_client and self.mcp_client.sessions:
@@ -60,8 +61,21 @@ class AppController:
                 "System: 경고: 연결된 MCP 서버가 없습니다. 도구 사용이 제한됩니다."
             )
 
+        if self.hotkey_manager:
+            if self.hotkey_manager.keyboard_available:
+                print("AppController: 단축키 리스너 시작 시도...")
+                self.hotkey_manager.start_listener()
+                print("AppController: 단축키 리스너 시작됨.")
+            else:
+                print(
+                    "AppController 경고: pynput 키보드 리스너를 사용할 수 없습니다. 단축키 비활성화됨."
+                )
+                self.response_queue.put(
+                    "System: 경고: 키보드 입력 감지 불가. 단축키 비활성화됨."
+                )
+
     def _initialize_services(self):
-        """MCP 클라이언트와 STT 서비스 초기화 (self.config 사용)"""
+        """MCP 클라이언트, STT 서비스, HotkeyManager 초기화"""
         try:
             stt_provider = self.config.get("stt_provider")
             whisper_model = self.config.get("whisper_model_name")
@@ -88,7 +102,27 @@ class AppController:
                 )
                 self.stt_service = None
 
-            # MCP 클라이언트 초기화
+            try:
+                print("AppController: HotkeyManager 초기화 시도...")
+                self.hotkey_manager = HotkeyManager()
+                print("AppController: HotkeyManager 초기화 완료.")
+                self.hotkey_manager.register_hotkeys(
+                    activate=True, show_window=True, paste=False
+                )
+                print("AppController: 전역 단축키 (음성, 창 토글) 등록 완료.")
+            except ImportError:
+                print(
+                    "AppController 오류: HotkeyManager 클래스를 import할 수 없습니다."
+                )
+                self.hotkey_manager = None
+            except Exception as e:
+                print(f"AppController 경고: HotkeyManager 초기화 실패 ({e}).")
+                traceback.print_exc()
+                self.hotkey_manager = None
+                self.response_queue.put(
+                    f"System: 경고: 단축키 관리자 초기화 실패 - {e}"
+                )
+
             model_name = self.config.get("model_name")
             safety_settings = self.config.get("safety_settings")
             generation_config = self.config.get("generation_config")
@@ -143,7 +177,7 @@ class AppController:
         self,
         query: str,
         additional_prompt: Optional[str],
-        file_path: Optional[str] = None,
+        file_paths: Optional[list[str]] = None,
     ):
         """비동기로 AI 쿼리 처리"""
         if not self.mcp_client:
@@ -156,14 +190,16 @@ class AppController:
         try:
             self.response_queue.put("System: AI 처리 중...")
             ai_response = await self.mcp_client.process_query(
-                query, additional_prompt=additional_prompt, file_path=file_path
+                query,
+                additional_prompt=additional_prompt,
+                file_paths=file_paths or [],
             )
             self.response_queue.put(f"AI\n{ai_response}")
         except Exception as e:
             self.response_queue.put(f"System: AI 처리 중 오류 발생: {e}")
             traceback.print_exc()
         finally:
-            self.attached_file_path = None
+            self.attached_files.clear()
             self.response_queue.put("System: Clear attachment label")
             self.response_queue.put("System: Buttons enabled")
 
@@ -183,12 +219,13 @@ class AppController:
                 if user_input:
                     self.response_queue.put(f"User\n{user_input}")
 
-                    current_file_path = self.attached_file_path
+                    current_file_paths = list(self.attached_files)
+
                     asyncio.run_coroutine_threadsafe(
                         self._process_ai_query(
                             user_input,
                             additional_prompt,
-                            file_path=current_file_path,
+                            file_paths=current_file_paths,
                         ),
                         self.loop,
                     )
@@ -220,7 +257,7 @@ class AppController:
                     "AppController 경고: MCP Client에 'start_new_chat' 메서드가 없습니다."
                 )
 
-            self.attached_file_path = None
+            self.attached_files.clear()
             print("AppController: 새로운 채팅 세션 시작됨.")
             self.response_queue.put("System: 새 채팅 시작됨.")
             return True
@@ -230,8 +267,6 @@ class AppController:
             traceback.print_exc()
             self.response_queue.put(f"System: 오류: {error_msg}")
             return False
-
-    # --- GUI 이벤트 핸들러에서 호출될 메서드들 ---
 
     def process_user_request(self, user_request: str, additional_prompt: Optional[str]):
         """사용자 텍스트 요청 처리"""
@@ -244,11 +279,13 @@ class AppController:
 
         self.response_queue.put(f"User\n{user_request}")
 
-        current_file_path = self.attached_file_path
+        current_file_paths = list(self.attached_files)
 
         asyncio.run_coroutine_threadsafe(
             self._process_ai_query(
-                user_request, additional_prompt, file_path=current_file_path
+                user_request,
+                additional_prompt,
+                file_paths=current_file_paths,
             ),
             self.loop,
         )
@@ -264,7 +301,7 @@ class AppController:
 
         additional_prompt = None
         if self.gui:
-            selected_prompt_display = self.gui.prompt_var.get()
+            selected_prompt_display = self.gui.prompt_dropdown.currentText()
             additional_prompt = self.prompt_manager.load_selected_prompt(
                 selected_prompt_display
             )
@@ -284,10 +321,26 @@ class AppController:
 
     def attach_file(self, filepath: str):
         """파일 첨부 요청 처리"""
-        self.attached_file_path = filepath
-        filename = os.path.basename(filepath)
-        print(f"AppController: 파일 첨부됨 - {filename}")
-        self.response_queue.put(f"System: Set attachment label|{filename}")
+        if filepath not in self.attached_files:
+            self.attached_files.append(filepath)
+            filename = os.path.basename(filepath)
+            print(
+                f"AppController: 파일 첨부됨 - {filename} (총 {len(self.attached_files)}개)"
+            )
+            return True
+        else:
+            print(
+                f"AppController: 이미 첨부된 파일입니다 - {os.path.basename(filepath)}"
+            )
+            return False
+
+    def get_attachment_count(self) -> int:
+        """현재 첨부된 파일의 개수를 반환합니다."""
+        return len(self.attached_files)
+
+    def get_attachment_paths(self) -> list[str]:
+        """현재 첨부된 파일의 경로 리스트를 반환합니다."""
+        return list(self.attached_files)
 
     async def cleanup(self):
         """애플리케이션 종료 시 리소스 정리"""
@@ -307,4 +360,10 @@ class AppController:
                 except Exception as e:
                     print(f"AppController 경고: STT 서비스 정리 중 오류: {e}")
             print("AppController: STT 서비스 정리 완료.")
+
+        if self.hotkey_manager:
+            print("AppController: HotkeyManager 리스너 종료 중...")
+            self.hotkey_manager.stop_listener()
+            print("AppController: HotkeyManager 리스너 종료 완료.")
+
         print("AppController: 정리 완료.")

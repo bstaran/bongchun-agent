@@ -1,5 +1,6 @@
 import os
-from tkinter import messagebox
+
+from PyQt6.QtWidgets import QMessageBox
 from .app_config import NO_PROMPT_OPTION
 
 
@@ -21,7 +22,7 @@ class PromptManager:
             try:
                 os.makedirs(self.prompt_dir)
             except OSError as e:
-                messagebox.showerror("오류", f"프롬프트 디렉토리 생성 실패: {e}")
+                QMessageBox.critical(None, "오류", f"프롬프트 디렉토리 생성 실패: {e}")
                 self.default_prompt_path = None
                 self.default_system_prompt = None
                 self.available_prompts = [NO_PROMPT_OPTION]
@@ -47,12 +48,12 @@ class PromptManager:
                     print(f"기본 시스템 프롬프트 로드됨: {self.default_prompt_path}")
                     return content
             except OSError as e:
-                messagebox.showerror(
-                    "오류", f"기본 프롬프트 파일을 읽을 수 없습니다: {e}"
+                QMessageBox.critical(
+                    None, "오류", f"기본 프롬프트 파일을 읽을 수 없습니다: {e}"
                 )
             except Exception as e:
-                messagebox.showerror(
-                    "오류", f"기본 프롬프트 읽기 중 예상치 못한 오류 발생: {e}"
+                QMessageBox.critical(
+                    None, "오류", f"기본 프롬프트 읽기 중 예상치 못한 오류 발생: {e}"
                 )
         else:
             print(
@@ -69,8 +70,8 @@ class PromptManager:
                     if filename.endswith(".txt") and filename != "default.txt":
                         prompts.append(os.path.splitext(filename)[0])
             except OSError as e:
-                messagebox.showerror(
-                    "오류", f"프롬프트 디렉토리를 읽을 수 없습니다: {e}"
+                QMessageBox.critical(
+                    None, "오류", f"프롬프트 디렉토리를 읽을 수 없습니다: {e}"
                 )
 
         if len(prompts) == 1:
@@ -79,8 +80,11 @@ class PromptManager:
 
     def load_selected_prompt(self, prompt_name):
         """선택된 *추가* 프롬프트 파일의 내용을 로드하여 반환합니다."""
-        if prompt_name == NO_PROMPT_OPTION or not prompt_name:
-            print("추가 프롬프트가 선택되지 않았습니다.")
+        if prompt_name == NO_PROMPT_OPTION:
+            print("추가 프롬프트가 선택되지 않았습니다. (NO_PROMPT_OPTION)")
+            return ""
+        if not prompt_name:
+            print("추가 프롬프트 이름이 비어 있습니다.")
             return ""
 
         prompt_file_path = os.path.join(self.prompt_dir, f"{prompt_name}.txt")
@@ -92,14 +96,17 @@ class PromptManager:
                 print(f"추가 프롬프트 내용 로드됨: {prompt_file_path}")
                 return content
             else:
-                messagebox.showerror(
+                QMessageBox.critical(
+                    None,
                     "오류",
                     f"선택한 프롬프트 파일 '{prompt_file_path}'을(를) 예기치 않게 찾을 수 없습니다.",
                 )
                 return ""
         except OSError as e:
-            messagebox.showerror("오류", f"프롬프트 파일을 읽을 수 없습니다: {e}")
+            QMessageBox.critical(None, "오류", f"프롬프트 파일을 읽을 수 없습니다: {e}")
             return ""
         except Exception as e:
-            messagebox.showerror("오류", f"프롬프트 읽기 중 예상치 못한 오류 발생: {e}")
+            QMessageBox.critical(
+                None, "오류", f"프롬프트 읽기 중 예상치 못한 오류 발생: {e}"
+            )
             return ""

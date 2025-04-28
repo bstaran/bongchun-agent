@@ -14,6 +14,7 @@ if src_path not in sys.path:
 try:
     from bongchun_agent.app_config import load_config
     from bongchun_agent.utils import run_async_loop
+    from PyQt6.QtWidgets import QApplication
     from bongchun_agent.gui import ChatGUI
     from bongchun_agent.app_controller import AppController
     from bongchun_agent.prompt_manager import PromptManager
@@ -38,6 +39,10 @@ def main():
     설정 로드, 컴포넌트 초기화, GUI 실행 및 종료 처리를 담당합니다.
     """
     print("main.py 실행됨. bongchun_agent 애플리케이션 시작...")
+
+    # 0. QApplication 인스턴스 생성
+    app = QApplication(sys.argv)
+    print("QApplication 인스턴스 생성됨.")
 
     # 1. 설정 로드
     config_data = None
@@ -70,34 +75,14 @@ def main():
     # 4. 컨트롤러에 GUI 참조 설정
     app_controller.set_gui(gui)
 
-    # 5. 단축키 관리자 초기화 및 시작
-    hotkey_manager = None
-    try:
-        hotkey_manager = HotkeyManager(
-            activate_callback=gui._voice_input_handler_wrapper,
-            show_window_callback=gui.bring_to_front,
-        )
-        hotkey_manager.start_listener()
-    except ImportError:
-        print(
-            "경고: pynput 라이브러리를 찾을 수 없어 단축키 기능이 비활성화됩니다.",
-            file=sys.stderr,
-        )
-    except AttributeError:
-        print(
-            "경고: ChatGUI에 '_voice_input_handler_wrapper' 메서드가 없습니다. 단축키 기능이 비활성화됩니다.",
-            file=sys.stderr,
-        )
-        hotkey_manager = None
-    except Exception as e:
-        print(f"단축키 리스너 시작 중 오류 발생: {e}", file=sys.stderr)
-        hotkey_manager = None
-
-    # 6. GUI 실행 및 종료 처리
+    # 5. GUI 실행 및 종료 처리
     try:
         print("GUI 실행 시작...")
         gui.run()
-        print("GUI 애플리케이션이 정상적으로 종료되었습니다.")
+        print("PyQt6 이벤트 루프 시작...")
+        exit_code = app.exec()
+        print(f"PyQt6 이벤트 루프 종료됨 (종료 코드: {exit_code}).")
+        sys.exit(exit_code)
 
     except Exception as e:
         print(f"GUI 실행 중 오류 발생:", file=sys.stderr)
@@ -105,12 +90,6 @@ def main():
 
     finally:
         print("애플리케이션 종료 처리 시작...")
-        if hotkey_manager:
-            try:
-                hotkey_manager.stop_listener()
-                print("단축키 리스너 중지됨.")
-            except Exception as e:
-                print(f"단축키 리스너 중지 중 오류: {e}", file=sys.stderr)
 
         if app_controller:
             try:
@@ -132,7 +111,6 @@ def main():
                 print(f"AppController 정리 중 오류 발생: {e}", file=sys.stderr)
                 traceback.print_exc()
 
-        # 비동기 루프 중지
         if async_loop.is_running():
             print("비동기 이벤트 루프 종료 요청...")
             async_loop.call_soon_threadsafe(async_loop.stop)
