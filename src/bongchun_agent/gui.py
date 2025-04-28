@@ -265,6 +265,17 @@ class ChatGUI:
             print("GUI: 종료 요청됨. main 루프 중지 예정...")
             print("GUI: 창 소멸됨.")
 
+    def bring_to_front(self):
+        """애플리케이션 창을 맨 앞으로 가져오고 포커스를 설정합니다."""
+        try:
+            if self.root.state() == "iconic":
+                self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+            print("GUI: 창을 앞으로 가져왔습니다.")
+        except tk.TclError as e:
+            print(f"GUI: 창을 앞으로 가져오는 중 오류 발생 - {e}")
+
     # --- 컨트롤러가 호출할 수 있는 메서드 ---
     def set_input_text(self, text: str):
         """입력 필드에 텍스트 설정"""

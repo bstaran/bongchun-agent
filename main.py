@@ -73,9 +73,11 @@ def main():
     # 5. 단축키 관리자 초기화 및 시작
     hotkey_manager = None
     try:
-        hotkey_manager = HotkeyManager(callback=gui._voice_input_handler_wrapper)
+        hotkey_manager = HotkeyManager(
+            activate_callback=gui._voice_input_handler_wrapper,
+            show_window_callback=gui.bring_to_front,
+        )
         hotkey_manager.start_listener()
-        print("단축키 리스너 시작됨.")
     except ImportError:
         print(
             "경고: pynput 라이브러리를 찾을 수 없어 단축키 기능이 비활성화됩니다.",

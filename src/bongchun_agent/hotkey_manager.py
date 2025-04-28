@@ -14,32 +14,48 @@ except ImportError:
 class HotkeyManager:
     """시스템 전역 단축키 리스너를 관리하는 클래스"""
 
-    def __init__(self, activate_callback):
+    def __init__(self, activate_callback, show_window_callback=None):
         """
         HotkeyManager를 초기화합니다.
 
         Args:
-            activate_callback: 단축키가 활성화될 때 호출될 콜백 함수.
-                               이 콜백은 GUI 스레드에서 안전하게 호출되어야 합니다.
-                               (예: app_instance._voice_input_handler_wrapper)
+            activate_callback: 음성 입력 활성화 단축키 콜백.
+            show_window_callback: 앱 창 표시 단축키 콜백 (선택 사항).
+                                  두 콜백 모두 GUI 스레드에서 안전하게 호출되어야 합니다.
         """
         self.activate_callback = activate_callback
+        self.show_window_callback = show_window_callback
         self.keyboard_available = keyboard is not None
         self.listener = None
         print(f"HotkeyManager 초기화됨. pynput 사용 가능: {self.keyboard_available}")
+        print(f" - 음성 활성화 콜백: {'설정됨' if activate_callback else '없음'}")
+        print(f" - 창 표시 콜백: {'설정됨' if show_window_callback else '없음'}")
 
-    def _internal_callback(self):
-        """단축키가 눌렸을 때 내부적으로 호출되는 콜백"""
-        print("전역 단축키 감지됨 (HotkeyManager 내부 콜백)!")
+    def _internal_activate_callback(self):
+        """음성 입력 활성화 단축키가 눌렸을 때 내부적으로 호출되는 콜백"""
+        print("음성 입력 활성화 단축키 감지됨!")
         if self.activate_callback:
             try:
                 self.activate_callback()
-                print("외부 콜백 함수 호출 완료.")
+                print("음성 입력 활성화 콜백 호출 완료.")
             except Exception as e:
-                print(f"단축키 콜백에서 외부 핸들러 호출 중 오류: {e}")
+                print(f"음성 입력 활성화 콜백 호출 중 오류: {e}")
                 traceback.print_exc()
         else:
-            print("오류: 외부 콜백 함수가 설정되지 않아 호출할 수 없습니다.")
+            print("오류: 음성 입력 활성화 콜백이 설정되지 않았습니다.")
+
+    def _internal_show_window_callback(self):
+        """앱 창 표시 단축키가 눌렸을 때 내부적으로 호출되는 콜백"""
+        print("앱 창 표시 단축키 감지됨!")
+        if self.show_window_callback:
+            try:
+                self.show_window_callback()
+                print("앱 창 표시 콜백 호출 완료.")
+            except Exception as e:
+                print(f"앱 창 표시 콜백 호출 중 오류: {e}")
+                traceback.print_exc()
+        else:
+            print("오류: 앱 창 표시 콜백이 설정되지 않았습니다.")
 
     def start_listener(self):
         """단축키 리스너를 시작합니다."""
@@ -54,7 +70,18 @@ class HotkeyManager:
             )
             shortcut_combination = "<ctrl>+<alt>+<shift>+t"
 
-        hotkey_map = {shortcut_combination: self._internal_callback}
+        hotkey_map = {}
+        if self.activate_callback:
+            hotkey_map[shortcut_combination] = self._internal_activate_callback
+            print(f" - 음성 활성화 단축키 등록: {shortcut_combination}")
+        if self.show_window_callback:
+            show_window_hotkey = "<f4>"
+            hotkey_map[show_window_hotkey] = self._internal_show_window_callback
+            print(f" - 앱 창 표시 단축키 등록: {show_window_hotkey}")
+
+        if not hotkey_map:
+            print("오류: 등록할 단축키 콜백이 없습니다.")
+            return
 
         try:
             if self.listener and self.listener.is_alive():
@@ -63,7 +90,8 @@ class HotkeyManager:
 
             self.listener = keyboard.GlobalHotKeys(hotkey_map)
             self.listener.start()
-            print(f"시스템 전역 단축키 리스너 시작됨 ({shortcut_combination})")
+            registered_keys = ", ".join(hotkey_map.keys())
+            print(f"시스템 전역 단축키 리스너 시작됨 ({registered_keys})")
         except Exception as e:
             print(f"오류: 전역 단축키 리스너 시작 실패 - {e}")
             traceback.print_exc()
