@@ -44,15 +44,44 @@ class MultiMCPClient:
                 model=f"models/{self.model_name}",
                 history=[],
             )
-            print(f"✅ Gemini 채팅 세션 시작 완료 (모델: {self.model_name}).")
+            print(
+                f"✅ Gemini 채팅 세션 시작 완료 (모델: {self.model_name}). 시스템 프롬프트는 chats.create에서 직접 지원되지 않습니다."
+            )
+
         except AttributeError as ae:
             print(f"❌ Gemini 클라이언트 생성 중 속성 오류 발생: {ae}")
             print("   google-generativeai 라이브러리가 최신 버전인지 확인하세요.")
+            raise
+        except TypeError as te:
+            print(f"❌ Gemini 채팅 세션 생성 중 타입 오류 발생: {te}")
+            print(
+                "   chats.create() 호출 시 지원되지 않는 인자가 사용되었을 수 있습니다."
+            )
             raise
         except Exception as e:
             print(f"❌ Gemini 클라이언트 또는 채팅 세션 초기화 실패: {e}")
             traceback.print_exc()
             raise
+
+    def start_new_chat(self):
+        """
+        현재 채팅 세션의 기록을 초기화하고 새 세션을 시작합니다.
+        기존의 시스템 프롬프트는 유지됩니다.
+        """
+        try:
+            self.chat_session = self.gemini_client.chats.create(
+                model=f"models/{self.model_name}",
+                history=[],
+            )
+            print("새 채팅 세션 시작됨 (대화 기록 초기화).")
+            return True
+        except TypeError as te:
+            print(f"❌ 새 채팅 세션 시작 실패 (타입 오류): {te}")
+            return False
+        except Exception as e:
+            print(f"❌ 새 채팅 세션 시작 실패: {e}")
+            traceback.print_exc()
+            return False
 
     def _clean_schema_for_gemini(
         self, schema: Optional[Dict[str, Any]], tool_name: str, path: str = "root"
@@ -213,9 +242,7 @@ class MultiMCPClient:
         args = config.get("args", [])
         env = config.get("env", os.environ.copy())
         if not command:
-            print(
-                f"경고: 서버 '{server_name}' 설정에 'command'가 없어 건너<0xEB><0x9C><0x9C>니다."
-            )
+            print(f"경고: 서버 '{server_name}' 설정에 'command'가 없어 건너뜁니다.")
             return
 
         server_params = StdioServerParameters(command=command, args=args, env=env)
@@ -252,9 +279,7 @@ class MultiMCPClient:
         url = config.get("url")
         headers = config.get("headers")
         if not url:
-            print(
-                f"경고: SSE 서버 '{server_name}' 설정에 'url'이 없어 건너<0xEB><0x9C><0x9C>니다."
-            )
+            print(f"경고: SSE 서버 '{server_name}' 설정에 'url'이 없어 건너뜁니다.")
             return
         try:
             print(f"'{server_name}' (SSE) 연결 시도: {url}")
@@ -293,19 +318,19 @@ class MultiMCPClient:
                     tasks.append(self._connect_and_init_stdio(server_name, config))
                 else:
                     print(
-                        f"경고: stdio 서버 '{server_name}' 설정에 'command'가 없어 건너<0xEB><0x9C><0x9C>니다."
+                        f"경고: stdio 서버 '{server_name}' 설정에 'command'가 없어 건너뜁니다."
                     )
             elif transport_type == "sse":
                 if "url" in config:
                     tasks.append(self._connect_and_init_sse(server_name, config))
                 else:
                     print(
-                        f"경고: SSE 서버 '{server_name}' 설정에 'url'이 없어 건너<0xEB><0x9C><0x9C>니다."
+                        f"경고: SSE 서버 '{server_name}' 설정에 'url'이 없어 건너뜁니다."
                     )
             # TODO: WebSocket 등 다른 전송 방식 지원 추가
             else:
                 print(
-                    f"경고: 지원되지 않는 전송 방식 '{transport_type}' (서버: {server_name}). 건너<0xEB><0x9C><0x9C>니다."
+                    f"경고: 지원되지 않는 전송 방식 '{transport_type}' (서버: {server_name}). 건너뜁니다."
                 )
 
         await asyncio.gather(*tasks)
@@ -316,13 +341,14 @@ class MultiMCPClient:
     async def process_query(
         self,
         query: str,
-        prompt_content: Optional[str] = None,
+        additional_prompt: Optional[str] = None,
         file_path: Optional[str] = None,
     ) -> str:
         """
-        사용자 쿼리와 선택적 파일 첨부를 처리하고, 필요시 MCP 도구를 호출합니다.
-        prompt_content가 제공되면 쿼리 앞에 추가됩니다.
+        사용자 쿼리와 선택적 파일 첨부, 추가 프롬프트를 처리하고, 필요시 MCP 도구를 호출합니다.
+        additional_prompt가 제공되면 쿼리 앞에 추가됩니다.
         file_path가 제공되고 이미지 파일이면 멀티모달 요청으로 처리합니다.
+        기본 시스템 프롬프트는 세션 생성 시 적용됩니다.
         """
         if not self.sessions:
             print("경고: 연결된 MCP 서버가 없습니다. 도구 사용이 제한됩니다.")
@@ -330,9 +356,11 @@ class MultiMCPClient:
             return "오류: Gemini 모델이 초기화되지 않았습니다."
 
         full_query = query
-        if prompt_content:
-            full_query = f"{prompt_content}\n\n---\n\nUser Request:\n{query}"
-            print(f"\n[DEBUG] Combined query with prompt:\n{full_query[:200]}...")
+        if additional_prompt:
+            full_query = f"{additional_prompt}\n\n---\n\nUser Request:\n{query}"
+            print(
+                f"\n[DEBUG] Combined query with additional prompt:\n{full_query[:200]}..."
+            )
         else:
             print("\n[DEBUG] Processing query without additional prompt content.")
 
@@ -420,7 +448,7 @@ class MultiMCPClient:
             )
         else:
             print(
-                "[DEBUG] 이미지 파일 경로가 제공되지 않았거나 Pillow 라이브러리가 없습니다. 이미지 처리 건너<0xEB><0x9C><0x9C>니다."
+                "[DEBUG] 이미지 파일 경로가 제공되지 않았거나 Pillow 라이브러리가 없습니다. 이미지 처리 건너뜁니다."
             )
 
         processed_image_info = None
@@ -510,7 +538,7 @@ class MultiMCPClient:
                 )
             else:
                 print(
-                    "[DEBUG] 이미지 파일 경로가 제공되지 않았거나 Pillow 라이브러리가 없습니다. 이미지 처리 건너<0xEB><0x9C><0x9C>니다."
+                    "[DEBUG] 이미지 파일 경로가 제공되지 않았거나 Pillow 라이브러리가 없습니다. 이미지 처리 건너뜁니다."
                 )
             request_content_parts = [full_query]
             log_data_items = [{"type": "text", "content": full_query}]
@@ -544,7 +572,8 @@ class MultiMCPClient:
             )
 
             response = self.chat_session.send_message(
-                request_content_parts, **send_args
+                request_content_parts,
+                **send_args,
             )
 
             final_text_parts = []
@@ -579,8 +608,8 @@ class MultiMCPClient:
                         print(
                             f"❌ 오류: Gemini가 알 수 없는 도구 '{tool_name}' 호출을 시도했습니다."
                         )
-                        response = await self.chat_session.send_message_async(
-                            FunctionResponse(
+                        response = self.chat_session.send_message(
+                            types.Part.from_function_response(
                                 name=tool_name,
                                 response={
                                     "content": f"Error: Tool '{tool_name}' not found or not configured correctly."
@@ -595,8 +624,8 @@ class MultiMCPClient:
                         print(
                             f"❌ 오류: 도구 '{tool_name}'을 처리할 서버 '{target_server_name}'의 세션을 찾을 수 없습니다."
                         )
-                        response = await self.chat_session.send_message_async(
-                            FunctionResponse(
+                        response = self.chat_session.send_message(
+                            types.Part.from_function_response(
                                 name=tool_name,
                                 response={
                                     "content": f"Error: Could not find active session for server '{target_server_name}' required by tool '{tool_name}'."
@@ -672,7 +701,7 @@ class MultiMCPClient:
                         print(
                             f"[DEBUG] Sending FunctionResponse to Gemini: {function_response_payload}"
                         )
-                        response = await self.chat_session.send_message_async(
+                        response = self.chat_session.send_message(
                             function_response_payload,
                             tools=gemini_tools,
                         )
@@ -695,7 +724,7 @@ class MultiMCPClient:
                         print(
                             f"[DEBUG] Sending ERROR FunctionResponse to Gemini: {error_response_payload}"
                         )
-                        response = await self.chat_session.send_message_async(
+                        response = self.chat_session.send_message(
                             error_response_payload,
                             tools=gemini_tools,
                         )

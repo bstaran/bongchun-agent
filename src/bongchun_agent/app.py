@@ -26,10 +26,15 @@ from bongchun_agent.client import MultiMCPClient
 try:
     from bongchun_agent.stt_service import STTService
 except ImportError:
+    print(
+        "오류: STTService 클래스를 import할 수 없습니다. stt_service.py 파일을 확인하세요."
+    )
     sys.exit(1)
 except RuntimeError as e:
     print(f"STT 서비스 초기화 실패: {e}")
     sys.exit(1)
+
+NO_PROMPT_OPTION = ""
 
 load_dotenv()
 
@@ -44,9 +49,9 @@ try:
     model_name = os.getenv("MODEL_NAME")
     if not model_name:
         print(
-            "경고: 환경 변수 'MODEL_NAME'이 설정되지 않았습니다. 기본값 'gemini-1.5-flash-latest'를 사용합니다."
+            "경고: 환경 변수 'MODEL_NAME'이 설정되지 않았습니다. 기본값 'gemini-2.5-flash-preview-04-17'를 사용합니다."
         )
-        model_name = "gemini-1.5-flash-latest"
+        model_name = "gemini-2.5-flash-preview-04-17"
 
     safety_settings_str = os.getenv("SAFETY_SETTINGS")
     safety_settings = None
@@ -188,10 +193,11 @@ class ChatGUI:
         self.attached_file_label = None
 
         self.prompt_dir = "prompt"
+        self.default_prompt_path = os.path.join(self.prompt_dir, "default.txt")
+        self.default_system_prompt = self._load_default_system_prompt()
         self.available_prompts = self._load_prompts()
         self.prompt_var = tk.StringVar(self.root)
         self.selected_prompt_content = ""
-        self.default_prompt_path = os.path.join(self.prompt_dir, "default.txt")
 
         self._initialize_services()
         self._create_widgets()
@@ -199,7 +205,7 @@ class ChatGUI:
 
         if self.available_prompts:
             self.prompt_var.set(self.available_prompts[0])
-            self._load_selected_prompt_content()
+            self._on_prompt_select()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
@@ -208,68 +214,90 @@ class ChatGUI:
             asyncio.run_coroutine_threadsafe(self._connect_mcp_servers(), self.loop)
 
     # --- 프롬프트 로딩 관련 메서드 ---
+    def _load_default_system_prompt(self):
+        """Loads the content of the default system prompt file (default.txt)."""
+        if os.path.exists(self.default_prompt_path):
+            try:
+                with open(self.default_prompt_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    print(
+                        f"Loaded default system prompt from: {self.default_prompt_path}"
+                    )
+                    return content
+            except OSError as e:
+                messagebox.showerror(
+                    "Error", f"Could not read default prompt file: {e}"
+                )
+            except Exception as e:
+                messagebox.showerror(
+                    "Error", f"An unexpected error occurred reading default prompt: {e}"
+                )
+        else:
+            print(
+                f"Warning: Default system prompt '{self.default_prompt_path}' not found. No default system prompt will be used."
+            )
+        return None
+
     def _load_prompts(self):
-        """Loads .txt file names (without extension) from the prompt directory."""
-        prompts = []
+        """Loads .txt file names (without extension) from the prompt directory, adding a 'None' option."""
+        prompts = [NO_PROMPT_OPTION]
         if os.path.isdir(self.prompt_dir):
             try:
                 for filename in os.listdir(self.prompt_dir):
-                    if filename.endswith(".txt"):
+                    if filename.endswith(".txt") and filename != "default.txt":
                         prompts.append(os.path.splitext(filename)[0])
             except OSError as e:
                 messagebox.showerror("Error", f"Could not read prompt directory: {e}")
 
-        if "default" not in prompts and os.path.exists(self.default_prompt_path):
-            prompts.insert(0, "default")
-        elif not prompts and not os.path.exists(self.default_prompt_path):
-            messagebox.showwarning(
-                "Warning", "No prompts found, including default.txt."
-            )
-            return ["default"]
-
-        if "default" in prompts:
-            prompts.remove("default")
-            prompts.insert(0, "default")
-        return prompts if prompts else ["default"]
+        if len(prompts) == 1:
+            print("Warning: No additional prompts found in the 'prompt' directory.")
+        return prompts
 
     def _load_selected_prompt_content(self):
-        """Loads the content of the currently selected prompt file."""
+        """Loads the content of the currently selected *additional* prompt file."""
         selected_prompt_name = self.prompt_var.get()
+
+        if selected_prompt_name == NO_PROMPT_OPTION:
+            self.selected_prompt_content = ""
+            print("No additional prompt selected.")
+            return
+
         prompt_file_path = os.path.join(self.prompt_dir, f"{selected_prompt_name}.txt")
 
         try:
             if os.path.exists(prompt_file_path):
                 with open(prompt_file_path, "r", encoding="utf-8") as f:
                     self.selected_prompt_content = f.read()
-                print(f"Loaded prompt content from: {prompt_file_path}")
-            elif os.path.exists(self.default_prompt_path):
-                messagebox.showwarning(
-                    "Warning",
-                    f"Prompt '{selected_prompt_name}.txt' not found. Using default prompt.",
-                )
-                with open(self.default_prompt_path, "r", encoding="utf-8") as f:
-                    self.selected_prompt_content = f.read()
-                self.prompt_var.set("default")
-                print(f"Loaded default prompt content from: {self.default_prompt_path}")
+                print(f"Loaded additional prompt content from: {prompt_file_path}")
             else:
-                messagebox.showerror("Error", "Default prompt 'default.txt' not found.")
+                messagebox.showerror(
+                    "Error",
+                    f"Selected prompt file '{prompt_file_path}' not found unexpectedly.",
+                )
                 self.selected_prompt_content = ""
+                self.prompt_var.set(NO_PROMPT_OPTION)
         except OSError as e:
             messagebox.showerror("Error", f"Could not read prompt file: {e}")
             self.selected_prompt_content = ""
+            self.prompt_var.set(NO_PROMPT_OPTION)
         except Exception as e:
             messagebox.showerror(
                 "Error", f"An unexpected error occurred reading prompt: {e}"
             )
             self.selected_prompt_content = ""
+            self.prompt_var.set(NO_PROMPT_OPTION)
 
     def _on_prompt_select(self, event=None):
         """Callback when a prompt is selected from the dropdown."""
         self._load_selected_prompt_content()
-        self.root.title(f"AI Agent Chat (Prompt: {self.prompt_var.get()})")
+        selected_display = self.prompt_var.get()
+        if selected_display == NO_PROMPT_OPTION:
+            self.root.title("AI Agent Chat (Prompt: None)")
+        else:
+            self.root.title(f"AI Agent Chat (Prompt: {selected_display})")
 
     def _initialize_services(self):
-        """MCP 클라이언트와 STT 서비스 초기화"""
+        """MCP 클라이언트와 STT 서비스 초기화 (기본 시스템 프롬프트 포함)"""
 
         try:
             try:
@@ -300,9 +328,12 @@ class ChatGUI:
                 model_name=model_name,
                 safety_settings=safety_settings,
                 generation_config=generation_config,
-                system_instruction=None,
+                system_instruction=self.default_system_prompt,
             )
-            print("MCP 클라이언트 초기화 완료.")
+            if self.default_system_prompt:
+                print("MCP 클라이언트 초기화 완료 (기본 시스템 프롬프트 적용됨).")
+            else:
+                print("MCP 클라이언트 초기화 완료 (기본 시스템 프롬프트 없음).")
 
         except Exception as e:
             messagebox.showerror("초기화 오류", f"서비스 초기화 중 오류: {e}")
@@ -332,7 +363,9 @@ class ChatGUI:
         prompt_select_frame = tk.Frame(self.root)
         prompt_select_frame.pack(pady=(10, 5), padx=10, fill=tk.X)
 
-        prompt_select_label = tk.Label(prompt_select_frame, text="Select Prompt:")
+        prompt_select_label = tk.Label(
+            prompt_select_frame, text="Select Additional Prompt:"
+        )
         prompt_select_label.pack(side=tk.LEFT, padx=(0, 5))
 
         self.prompt_dropdown = ttk.Combobox(
@@ -342,16 +375,8 @@ class ChatGUI:
             state="readonly",
             width=30,
         )
-        if self.available_prompts:
-            self.prompt_dropdown.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            self.prompt_dropdown.bind("<<ComboboxSelected>>", self._on_prompt_select)
-        else:
-            no_prompt_label = tk.Label(
-                prompt_select_frame,
-                text="No prompts found in 'prompt' directory.",
-                fg="grey",
-            )
-            no_prompt_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.prompt_dropdown.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.prompt_dropdown.bind("<<ComboboxSelected>>", self._on_prompt_select)
 
         # --- 사용자 요청 입력 프레임 ---
         request_frame = tk.Frame(self.root)
@@ -434,15 +459,6 @@ class ChatGUI:
             messagebox.showwarning("Input Error", "Please enter your request.")
             return "break"
 
-        if not self.selected_prompt_content:
-            self._load_selected_prompt_content()
-            if not self.selected_prompt_content:
-                messagebox.showerror(
-                    "Error",
-                    "Cannot send request without prompt content (default.txt missing?).",
-                )
-                return "break"
-
         if not self.mcp_client:
             messagebox.showerror("오류", "MCP 클라이언트가 준비되지 않았습니다.")
             return "break"
@@ -456,12 +472,12 @@ class ChatGUI:
         self.request_entry.delete("1.0", tk.END)
         self._disable_buttons()
 
-        # 현재 첨부된 파일 경로를 가져옴
         current_file_path = self.attached_file_path
+        additional_prompt = self.selected_prompt_content
 
         asyncio.run_coroutine_threadsafe(
             self._process_ai_query(
-                user_request, self.selected_prompt_content, file_path=current_file_path
+                user_request, additional_prompt, file_path=current_file_path
             ),
             self.loop,
         )
@@ -498,13 +514,13 @@ class ChatGUI:
             self.recording_status_label.lift()
         self._disable_buttons()
 
-        prompt_content = self.selected_prompt_content
+        additional_prompt = self.selected_prompt_content
         threading.Thread(
-            target=self._run_stt_in_thread, args=(prompt_content,), daemon=True
+            target=self._run_stt_in_thread, args=(additional_prompt,), daemon=True
         ).start()
 
-    def _run_stt_in_thread(self, prompt_content):
-        """STT 작업을 별도 스레드에서 실행"""
+    def _run_stt_in_thread(self, additional_prompt):
+        """STT 작업을 별도 스레드에서 실행 (추가 프롬프트 전달)"""
         try:
             audio_data = self.stt_service.record_audio()
             if audio_data is not None and audio_data.size > 0:
@@ -515,7 +531,7 @@ class ChatGUI:
                     asyncio.run_coroutine_threadsafe(
                         self._process_ai_query(
                             user_input,
-                            self.selected_prompt_content,
+                            additional_prompt,  # 추가 프롬프트 전달
                             file_path=current_file_path,
                         ),
                         self.loop,
@@ -555,16 +571,20 @@ class ChatGUI:
             return False
 
         try:
-            self.mcp_client.chat_session = self.mcp_client.gemini_client.chats.create(
-                model=f"models/{self.mcp_client.model_name}",
-                history=[],
-            )
+            if hasattr(self.mcp_client, "start_new_chat"):
+                self.mcp_client.start_new_chat()
+                print("MCP Client chat history reset.")
+            else:
+                print(
+                    "Warning: MCP Client does not have 'start_new_chat' method. History might persist."
+                )
+
             self.response_area.config(state=tk.NORMAL)
             self.response_area.delete("1.0", tk.END)
             self.response_area.config(state=tk.DISABLED)
             self.attached_file_path = None
             self.attached_file_label.config(text="")
-            print("새로운 채팅 세션 시작됨 (첨부 파일 초기화됨).")
+            print("새로운 채팅 세션 시작됨 (대화 기록 초기화됨, 첨부 파일 초기화됨).")
             return True
         except Exception as e:
             error_msg = f"새로운 채팅 세션을 시작하는 데 실패했습니다: {e}"
@@ -579,13 +599,13 @@ class ChatGUI:
         self._start_new_chat()
 
     async def _process_ai_query(
-        self, query: str, prompt_content: str, file_path: Optional[str] = None
+        self, query: str, additional_prompt: str, file_path: Optional[str] = None
     ):
-        """비동기로 AI 쿼리 처리 (프롬프트 내용 및 파일 경로 포함)"""
+        """비동기로 AI 쿼리 처리 (추가 프롬프트 및 파일 경로 포함)"""
         try:
             self.response_queue.put("System: AI 처리 중...")
             ai_response = await self.mcp_client.process_query(
-                query, prompt_content=prompt_content, file_path=file_path
+                query, additional_prompt=additional_prompt, file_path=file_path
             )
             self.response_queue.put(f"AI: {ai_response}")
         except Exception as e:
@@ -627,7 +647,7 @@ class ChatGUI:
                 elif isinstance(message, str) and not message.startswith("System:"):
                     self._display_response(message)
                 elif isinstance(message, str):
-                    print(message)
+                    print(message)  # 시스템 메시지 등 콘솔에 출력
         except queue.Empty:
             pass
         finally:
@@ -678,7 +698,6 @@ class ChatGUI:
         self.root.mainloop()
 
 
-# --- 비동기 루프를 실행할 스레드 ---
 def run_async_loop(loop):
     asyncio.set_event_loop(loop)
     try:
@@ -691,7 +710,6 @@ def run_async_loop(loop):
         print("비동기 이벤트 루프 종료 완료.")
 
 
-# --- 단축키 콜백 함수 ---
 def on_activate_voice_input(app_instance):
     """단축키 활성화 시 호출될 콜백"""
     print("전역 단축키 감지됨!")
@@ -706,7 +724,6 @@ def on_activate_voice_input(app_instance):
         print("오류: ChatGUI 인스턴스가 없어 콜백을 실행할 수 없습니다.")
 
 
-# --- GUI 실행 함수 ---
 def run_gui(args):
     """GUI 애플리케이션을 초기화하고 실행합니다."""
     async_loop = asyncio.new_event_loop()
@@ -720,7 +737,6 @@ def run_gui(args):
     try:
         app = ChatGUI(async_loop)
 
-        # --- 시스템 전역 단축키 리스너 설정 ---
         if keyboard:
             shortcut_combination = "<cmd>+<ctrl>+<shift>+t"
             if platform.system() != "Darwin":

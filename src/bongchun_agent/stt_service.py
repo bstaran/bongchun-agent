@@ -113,7 +113,6 @@ class STTService:
                 )
                 device = "cpu"
         elif self.whisper_device_preference == "auto":
-            # 자동 감지 로직 (CUDA > MPS > CPU 우선)
             if torch.cuda.is_available():
                 print("자동 감지: CUDA GPU 사용 가능. 장치를 'cuda'로 설정합니다.")
                 device = "cuda"
@@ -263,8 +262,8 @@ class STTService:
 
         bytes_io = io.BytesIO()
         with wave.open(bytes_io, "wb") as wf:
-            wf.setnchannels(1) 
-            wf.setsampwidth(2) 
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(audio_data_int16.tobytes())
         return bytes_io.getvalue()
