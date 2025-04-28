@@ -355,104 +355,22 @@ class MultiMCPClient:
         if not hasattr(self, "chat_session"):
             return "오류: Gemini 모델이 초기화되지 않았습니다."
 
-        full_query = query
-        if additional_prompt:
-            full_query = f"{additional_prompt}\n\n---\n\nUser Request:\n{query}"
-            print(
-                f"\n[DEBUG] Combined query with additional prompt:\n{full_query[:200]}..."
-            )
-        else:
-            print("\n[DEBUG] Processing query without additional prompt content.")
-
-        print("\nGemini 모델에게 요청 전송 중...")
-        gemini_tools = self._mcp_tools_to_gemini_tools()
-
-        # --- 이미지 처리 로직 시작 ---
-        image_part = None
-        print(
-            f"[DEBUG] 이미지 처리 시작. file_path: {file_path}, Pillow 사용 가능: {bool(Image)}"
-        )
-        if file_path and Image:
-            try:
-                p = Path(file_path)
-                print(f"[DEBUG] 파일 경로 객체 생성: {p}")
-                if p.is_file():
-                    print(f"[DEBUG] 파일 존재 확인: {file_path}")
-                    mime_type, _ = mimetypes.guess_type(p)
-                    print(f"[DEBUG] MIME 타입 확인: {mime_type} for {file_path}")
-                    if mime_type and mime_type.startswith("image/"):
-                        print(f"[DEBUG] 이미지 파일 MIME 타입 확인됨: {mime_type}")
-                        try:
-                            print(f"[DEBUG] Pillow로 이미지 열기 시도: {file_path}")
-                            img = Image.open(p)
-                            img.verify()
-                            img = Image.open(p)
-                            print(
-                                f"[DEBUG] Pillow로 이미지 열기 성공: {file_path}, Format: {img.format}, Size: {img.size}"
-                            )
-                        except UnidentifiedImageError:
-                            print(
-                                f"[DEBUG] 오류: Pillow가 이미지 파일을 식별할 수 없음: {file_path}"
-                            )
-                            raise
-                        except Exception as img_err:
-                            print(
-                                f"[DEBUG] 오류: Pillow 이미지 처리 중 오류 발생: {img_err}"
-                            )
-                            raise
-
-                        try:
-                            print(
-                                f"[DEBUG] types.Part.from_data 생성 시도: {file_path}"
-                            )
-                            image_part = types.Part.from_bytes(
-                                mime_type=mime_type,
-                                data=p.read_bytes(),
-                            )
-                            print(
-                                f"[DEBUG] types.Part.from_bytes 생성 성공. MimeType: {mime_type}, Data Length: {len(image_part.data) if hasattr(image_part, 'data') else 'N/A'}"
-                            )
-                        except Exception as part_err:
-                            print(
-                                f"[DEBUG] 오류: types.Part.from_data 생성 중 오류 발생: {part_err}"
-                            )
-                            raise
-
-                        print("[DEBUG] 이미지 데이터를 Gemini 요청에 포함 준비 완료.")
-                    else:
-                        print(
-                            f"[DEBUG] 경고: 첨부된 파일 '{file_path}'은(는) 이미지 파일이 아닙니다 (MIME: {mime_type}). 텍스트 요청만 보냅니다."
-                        )
-                else:
-                    print(
-                        f"[DEBUG] 경고: 첨부된 파일 경로 '{file_path}'을(를) 찾을 수 없거나 파일이 아닙니다."
-                    )
-            except FileNotFoundError:
-                print(
-                    f"[DEBUG] 오류: 첨부된 이미지 파일 '{file_path}'을(를) 찾을 수 없습니다."
-                )
-                return f"오류: 첨부 파일 '{file_path}'을(를) 찾을 수 없습니다."
-            except UnidentifiedImageError:
-                print(f"[DEBUG] 오류 처리: UnidentifiedImageError for {file_path}")
-                return f"오류: 첨부 파일 '{file_path}'은(는) 유효한 이미지 파일이 아닙니다."
-            except IOError as e:
-                print(f"[DEBUG] 오류 처리: IOError for {file_path}: {e}")
-                return f"오류: 첨부 파일 '{file_path}' 처리 중 IO 오류 발생: {e}"
-            except Exception as e:
-                print(f"[DEBUG] 오류 처리: 예기치 않은 오류 for {file_path}: {e}")
-                traceback.print_exc()
-                return f"오류: 첨부 파일 처리 중 예기치 않은 오류 발생: {e}"
-        elif file_path and not Image:
-            print(
-                "[DEBUG] 경고: Pillow 라이브러리가 없어 이미지 파일을 처리할 수 없습니다. 텍스트 요청만 보냅니다."
-            )
-        else:
-            print(
-                "[DEBUG] 이미지 파일 경로가 제공되지 않았거나 Pillow 라이브러리가 없습니다. 이미지 처리 건너뜁니다."
-            )
-
-        processed_image_info = None
         try:
+            full_query = query
+            if additional_prompt:
+                full_query = f"{additional_prompt}\n\n---\n\nUser Request:\n{query}"
+                print(
+                    f"\n[DEBUG] Combined query with additional prompt:\n{full_query[:200]}..."
+                )
+            else:
+                print("\n[DEBUG] Processing query without additional prompt content.")
+
+            print("\nGemini 모델에게 요청 전송 중...")
+            gemini_tools = self._mcp_tools_to_gemini_tools()
+
+            # --- 이미지 처리 로직 시작 ---
+            image_part = None
+            mime_type = None
             print(
                 f"[DEBUG] 이미지 처리 시작. file_path: {file_path}, Pillow 사용 가능: {bool(Image)}"
             )
@@ -470,10 +388,12 @@ class MultiMCPClient:
                                 print(f"[DEBUG] Pillow로 이미지 열기 시도: {file_path}")
                                 img = Image.open(p)
                                 img.verify()
+                                img.close()
                                 img = Image.open(p)
                                 print(
                                     f"[DEBUG] Pillow로 이미지 열기 성공: {file_path}, Format: {img.format}, Size: {img.size}"
                                 )
+                                img.close()
                             except UnidentifiedImageError:
                                 print(
                                     f"[DEBUG] 오류: Pillow가 이미지 파일을 식별할 수 없음: {file_path}"
@@ -487,22 +407,18 @@ class MultiMCPClient:
 
                             try:
                                 print(
-                                    f"[DEBUG] types.Part.from_bytes 생성 시도: {file_path}"
+                                    f"[DEBUG] types.Part.from_data 생성 시도: {file_path}"
                                 )
                                 image_part = types.Part.from_bytes(
                                     mime_type=mime_type,
                                     data=p.read_bytes(),
                                 )
-                                processed_image_info = (
-                                    image_part,
-                                    mime_type,
-                                )
                                 print(
-                                    f"[DEBUG] types.Part.from_bytes 생성 성공. MimeType: {mime_type}"
+                                    f"[DEBUG] types.Part.from_bytes 생성 성공. MimeType: {mime_type}, Data Length: {len(image_part.data) if hasattr(image_part, 'data') else 'N/A'}"
                                 )
                             except Exception as part_err:
                                 print(
-                                    f"[DEBUG] 오류: types.Part.from_bytes 생성 중 오류 발생: {part_err}"
+                                    f"[DEBUG] 오류: types.Part.from_data 생성 중 오류 발생: {part_err}"
                                 )
                                 raise
 
@@ -529,7 +445,9 @@ class MultiMCPClient:
                     print(f"[DEBUG] 오류 처리: IOError for {file_path}: {e}")
                     return f"오류: 첨부 파일 '{file_path}' 처리 중 IO 오류 발생: {e}"
                 except Exception as e:
-                    print(f"[DEBUG] 오류 처리: 예기치 않은 오류 for {file_path}: {e}")
+                    print(
+                        f"[DEBUG] 오류 처리: 예기치 않은 이미지 처리 오류 for {file_path}: {e}"
+                    )
                     traceback.print_exc()
                     return f"오류: 첨부 파일 처리 중 예기치 않은 오류 발생: {e}"
             elif file_path and not Image:
@@ -540,24 +458,25 @@ class MultiMCPClient:
                 print(
                     "[DEBUG] 이미지 파일 경로가 제공되지 않았거나 Pillow 라이브러리가 없습니다. 이미지 처리 건너뜁니다."
                 )
+            # --- 이미지 처리 로직 끝 ---
+
             request_content_parts = [full_query]
             log_data_items = [{"type": "text", "content": full_query}]
 
-            if processed_image_info:
-                image_part_obj, image_mime_type = processed_image_info
-                request_content_parts.append(image_part_obj)
+            if image_part:
+                print("[DEBUG] Sending multimodal request (text + image)")
+                request_content_parts.append(image_part)
                 log_data_items.append(
                     {
                         "type": "image",
-                        "mime_type": image_mime_type,
+                        "mime_type": mime_type,
                         "data_length": (
-                            len(image_part_obj.data)
-                            if hasattr(image_part_obj, "data")
+                            len(image_part.data)
+                            if hasattr(image_part, "data")
                             else "N/A"
                         ),
                     }
                 )
-                print("[DEBUG] Sending multimodal request (text + image)")
             else:
                 print("[DEBUG] Sending text-only request")
 
@@ -681,12 +600,12 @@ class MultiMCPClient:
                                 )
                             else:
                                 json_contents = [
-                                    c.model_dump_json
+                                    c.model_dump_json()
                                     for c in mcp_result.content
                                     if isinstance(c, mcp_types.JsonContent)
                                 ]
                                 if json_contents:
-                                    result_content = json.dumps(json_contents[0])
+                                    result_content = json.dumps(json_contents)
                                     print(
                                         f"[MCP 도구 '{tool_name}' JSON 결과]: {result_content[:200]}{'...' if len(result_content) > 200 else ''}"
                                     )
@@ -702,7 +621,10 @@ class MultiMCPClient:
                             f"[DEBUG] Sending FunctionResponse to Gemini: {function_response_payload}"
                         )
                         response = self.chat_session.send_message(
-                            function_response_payload,
+                            types.Part.from_function_response(
+                                name=tool_name,
+                                response={"content": result_content},
+                            ),
                             tools=gemini_tools,
                         )
                         print(
@@ -725,7 +647,12 @@ class MultiMCPClient:
                             f"[DEBUG] Sending ERROR FunctionResponse to Gemini: {error_response_payload}"
                         )
                         response = self.chat_session.send_message(
-                            error_response_payload,
+                            types.Part.from_function_response(
+                                name=tool_name,
+                                response={
+                                    "content": f"Error: Exception during tool execution: {tool_error}"
+                                },
+                            ),
                             tools=gemini_tools,
                         )
                         print(
