@@ -15,7 +15,7 @@ try:
     from bongchun_agent.app_config import load_config
     from bongchun_agent.utils import run_async_loop
     from PyQt6.QtWidgets import QApplication
-    from bongchun_agent.gui import ChatGUI
+    from bongchun_agent.gui import BongchunAgentGUI  # 클래스 이름 변경
     from bongchun_agent.app_controller import AppController
     from bongchun_agent.prompt_manager import PromptManager
     from bongchun_agent.hotkey_manager import HotkeyManager
@@ -70,7 +70,13 @@ def main():
     app_controller = AppController(
         loop=async_loop, config=config_data, prompt_manager=prompt_manager
     )
-    gui = ChatGUI(controller=app_controller)
+    # BongchunAgentGUI 생성자에 필요한 인자 전달
+    gui = BongchunAgentGUI(
+        client=app_controller.mcp_client,
+        prompt_manager=prompt_manager,
+        hotkey_manager=app_controller.hotkey_manager,
+        app_controller=app_controller,
+    )
 
     # 4. 컨트롤러에 GUI 참조 설정
     app_controller.set_gui(gui)
@@ -78,7 +84,7 @@ def main():
     # 5. GUI 실행 및 종료 처리
     try:
         print("GUI 실행 시작...")
-        gui.run()
+        gui.show()
         print("PyQt6 이벤트 루프 시작...")
         exit_code = app.exec()
         print(f"PyQt6 이벤트 루프 종료됨 (종료 코드: {exit_code}).")

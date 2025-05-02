@@ -519,17 +519,20 @@ class MultiMCPClient:
                         return "오류: AI로부터 유효한 응답을 받지 못했습니다."
 
                 latest_response_part = candidate_content.parts[0]
+                print(
+                    f"[DEBUG] Received latest_response_part. Type: {type(latest_response_part)}, Content: {latest_response_part}"
+                )
 
-                if hasattr(latest_response_part, "text") and latest_response_part.text:
-                    final_text_parts.append(latest_response_part.text)
-                    break
-
-                elif (
+                # 1. Check for structured function_call first
+                if (
                     hasattr(latest_response_part, "function_call")
                     and latest_response_part.function_call
                 ):
-                    function_call = latest_response_part.function_call
-                    tool_name = function_call.name
+                    function_call_obj = latest_response_part.function_call
+                    tool_name = function_call_obj.name
+                    print(
+                        f"[DEBUG] Received structured function_call for tool: {tool_name}"
+                    )
 
                     target_server_name = self.tool_to_server_map.get(tool_name)
                     if not target_server_name:
@@ -564,10 +567,11 @@ class MultiMCPClient:
                         continue
 
                     tool_args_dict = {}
-                    if hasattr(function_call, "args") and function_call.args:
+                    if hasattr(function_call_obj, "args") and function_call_obj.args:
                         try:
                             tool_args_dict = {
-                                key: value for key, value in function_call.args.items()
+                                key: value
+                                for key, value in function_call_obj.args.items()
                             }
                         except Exception as e:
                             print(
@@ -581,21 +585,20 @@ class MultiMCPClient:
 
                     try:
                         print(
-                            f"[DEBUG] Calling MCP tool '{tool_name}' on server '{target_server_name}' with args: {tool_args_dict}"
+                            f"[DEBUG] Attempting to call MCP tool '{tool_name}' via session (structured)..."
                         )
                         mcp_result = await target_session.call_tool(
                             tool_name, arguments=tool_args_dict
                         )
-                        print(f"[DEBUG] MCP tool '{tool_name}' result: {mcp_result}")
+                        print(
+                            f"[DEBUG] MCP tool '{tool_name}' result (structured): {mcp_result}"
+                        )
 
                         result_content = (
                             "[Tool executed successfully, no specific content returned]"
                         )
                         if mcp_result.isError:
                             result_content = f"[Error executing tool '{tool_name}': {mcp_result.error.message if mcp_result.error else 'Unknown error'}]"
-                            print(
-                                f"MCP 도구 '{tool_name}' 실행 오류 보고됨: {result_content}"
-                            )
                         elif mcp_result.content:
                             text_contents = [
                                 c.text
@@ -604,70 +607,215 @@ class MultiMCPClient:
                             ]
                             if text_contents:
                                 result_content = "\n".join(text_contents)
-                                print(
-                                    f"[MCP 도구 '{tool_name}' 결과]: {result_content[:200]}{'...' if len(result_content) > 200 else ''}"
-                                )
-                            else:
-                                json_contents = [
-                                    c.model_dump_json()
-                                    for c in mcp_result.content
-                                    if isinstance(c, mcp_types.JsonContent)
-                                ]
-                                if json_contents:
-                                    result_content = json.dumps(json_contents)
-                                    print(
-                                        f"[MCP 도구 '{tool_name}' JSON 결과]: {result_content[:200]}{'...' if len(result_content) > 200 else ''}"
-                                    )
-                                else:
-                                    result_content = f"[MCP 도구 '{tool_name}' 결과 type: {type(mcp_result.content[0])}]"
-                                    print(result_content)
 
                         function_response_payload = FunctionResponse(
                             name=tool_name,
                             response={"content": result_content},
                         )
                         print(
-                            f"[DEBUG] Sending FunctionResponse to Gemini: {function_response_payload}"
+                            f"[DEBUG] Preparing FunctionResponse for Gemini (structured): {function_response_payload}"
                         )
                         response = self.chat_session.send_message(
                             types.Part.from_function_response(
                                 name=tool_name,
                                 response={"content": result_content},
                             ),
-                            tools=gemini_tools,
+                            # tools=gemini_tools, # <- FunctionResponse 전송 시 tools 인자 불필요
                         )
                         print(
-                            f"[DEBUG] Response from Gemini after sending FunctionResponse: {response.candidates[0].content.parts[0] if response.candidates else 'No candidates'}"
-                        )
+                            f"[DEBUG] Sent FunctionResponse for '{tool_name}' (structured). Waiting for Gemini's next response..."
+                        )  # 로그 추가/수정
+                        if (
+                            response.candidates
+                            and response.candidates[0].content
+                            and response.candidates[0].content.parts
+                        ):
+                            print(
+                                f"[DEBUG] Received response part from Gemini after FunctionResponse (structured): {response.candidates[0].content.parts[0]}"
+                            )
+                        else:
+                            print(
+                                "[DEBUG] Received no valid response part from Gemini after FunctionResponse (structured)."
+                            )
                         continue
 
                     except Exception as tool_error:
                         print(
-                            f"❌ ERROR during MCP tool '{tool_name}' execution: {tool_error}"
+                            f"❌ ERROR during MCP tool '{tool_name}' execution (structured): {tool_error}"
                         )
                         traceback.print_exc()
-                        error_response_payload = FunctionResponse(
-                            name=tool_name,
-                            response={
-                                "content": f"Error: Exception during tool execution: {tool_error}"
-                            },
-                        )
-                        print(
-                            f"[DEBUG] Sending ERROR FunctionResponse to Gemini: {error_response_payload}"
-                        )
                         response = self.chat_session.send_message(
                             types.Part.from_function_response(
                                 name=tool_name,
                                 response={
-                                    "content": f"Error: Exception during tool execution: {tool_error}"
+                                    "content": f"Error: Exception during tool execution (structured): {tool_error}"
                                 },
                             ),
                             tools=gemini_tools,
                         )
-                        print(
-                            f"[DEBUG] Response from Gemini after sending ERROR FunctionResponse: {response.candidates[0].content.parts[0] if response.candidates else 'No candidates'}"
-                        )
                         continue
+
+                # 2. If no structured function_call, check if text contains a function call JSON or is final text
+                elif (
+                    hasattr(latest_response_part, "text") and latest_response_part.text
+                ):
+                    text_content = latest_response_part.text.strip()
+                    if (
+                        text_content.startswith("```json")
+                        and '"function_call"' in text_content
+                    ):
+                        print(
+                            "[DEBUG] Received text that looks like a function call JSON."
+                        )
+                        try:
+                            json_str = text_content.split("```json\n", 1)[1].rsplit(
+                                "\n```", 1
+                            )[0]
+                            parsed_json = json.loads(json_str)
+                            if "function_call" in parsed_json:
+                                function_call_data = parsed_json["function_call"]
+                                tool_name = function_call_data.get("name")
+                                tool_args_dict = function_call_data.get("arguments", {})
+
+                                if tool_name:
+                                    print(
+                                        f"[DEBUG] Parsed function_call from text: tool={tool_name}, args={tool_args_dict}"
+                                    )
+                                    target_server_name = self.tool_to_server_map.get(
+                                        tool_name
+                                    )
+                                    if not target_server_name:
+                                        print(
+                                            f"❌ 오류: Gemini가 알 수 없는 도구 '{tool_name}' 호출을 시도했습니다 (from text)."
+                                        )
+                                        response = self.chat_session.send_message(
+                                            types.Part.from_function_response(
+                                                name=tool_name,
+                                                response={
+                                                    "content": f"Error: Tool '{tool_name}' not found (from text)."
+                                                },
+                                            ),
+                                            tools=gemini_tools,
+                                        )
+                                        continue
+
+                                    target_session = self.sessions.get(
+                                        target_server_name
+                                    )
+                                    if not target_session:
+                                        print(
+                                            f"❌ 오류: 도구 '{tool_name}' 서버 '{target_server_name}' 세션 없음 (from text)."
+                                        )
+                                        response = self.chat_session.send_message(
+                                            types.Part.from_function_response(
+                                                name=tool_name,
+                                                response={
+                                                    "content": f"Error: Server session '{target_server_name}' not found (from text)."
+                                                },
+                                            ),
+                                            tools=gemini_tools,
+                                        )
+                                        continue
+
+                                    print(
+                                        f"[DEBUG] Attempting to call MCP tool '{tool_name}' via session (from text)..."
+                                    )
+                                    try:
+                                        mcp_result = await target_session.call_tool(
+                                            tool_name, arguments=tool_args_dict
+                                        )
+                                        print(
+                                            f"[DEBUG] MCP tool '{tool_name}' result (from text): {mcp_result}"
+                                        )
+
+                                        result_content = "[Tool executed successfully, no specific content returned]"
+                                        if mcp_result.isError:
+                                            result_content = f"[Error executing tool '{tool_name}': {mcp_result.error.message if mcp_result.error else 'Unknown error'}]"
+                                        elif mcp_result.content:
+                                            text_contents = [
+                                                c.text
+                                                for c in mcp_result.content
+                                                if isinstance(c, mcp_types.TextContent)
+                                            ]
+                                            if text_contents:
+                                                result_content = "\n".join(
+                                                    text_contents
+                                                )
+
+                                        function_response_payload = FunctionResponse(
+                                            name=tool_name,
+                                            response={"content": result_content},
+                                        )
+                                        print(
+                                            f"[DEBUG] Preparing FunctionResponse for Gemini (from text): {function_response_payload}"
+                                        )
+                                        response = self.chat_session.send_message(
+                                            types.Part.from_function_response(
+                                                name=tool_name,
+                                                response={"content": result_content},
+                                            )
+                                        )
+                                        if (
+                                            response.candidates
+                                            and response.candidates[0].content
+                                            and response.candidates[0].content.parts
+                                        ):
+                                            print(
+                                                f"[DEBUG] Received response part from Gemini after FunctionResponse (from text): {response.candidates[0].content.parts[0]}"
+                                            )
+                                        else:
+                                            print(
+                                                "[DEBUG] Received no valid response part from Gemini after FunctionResponse (from text)."
+                                            )
+                                        continue
+
+                                    except Exception as tool_error:
+                                        print(
+                                            f"❌ ERROR during MCP tool '{tool_name}' execution (from text): {tool_error}"
+                                        )
+                                        traceback.print_exc()
+                                        response = self.chat_session.send_message(
+                                            types.Part.from_function_response(
+                                                name=tool_name,
+                                                response={
+                                                    "content": f"Error: Exception during tool execution (from text): {tool_error}"
+                                                },
+                                            )
+                                        )
+                                        continue
+                                else:
+                                    print(
+                                        "[DEBUG] Parsed JSON from text, but 'name' field missing in function_call. Treating as plain text."
+                                    )
+                                    final_text_parts.append(text_content)
+                                    break
+                            else:
+                                print(
+                                    "[DEBUG] Parsed JSON from text, but 'function_call' key missing. Treating as plain text."
+                                )
+                                final_text_parts.append(text_content)
+                                break
+                        except json.JSONDecodeError:
+                            print(
+                                "[DEBUG] Text started like JSON, but failed to parse. Treating as plain text."
+                            )
+                            final_text_parts.append(text_content)
+                            break
+                        except Exception as parse_err:
+                            print(
+                                f"[DEBUG] Error parsing or processing text as function call JSON: {parse_err}. Treating as plain text."
+                            )
+                            final_text_parts.append(text_content)
+                            break
+                    else:
+                        # 3. If text doesn't look like function call JSON, treat as final text response
+                        print(
+                            "[DEBUG] Received final text content (not function call JSON)."
+                        )
+                        final_text_parts.append(text_content)
+                        break
+
+                # 4. Handle unexpected response types (if neither function_call nor text)
                 else:
                     print(
                         f"경고: Gemini로부터 예상치 못한 응답 형식을 받았습니다: {latest_response_part}"
@@ -677,6 +825,9 @@ class MultiMCPClient:
                     else:
                         return f"오류: AI로부터 예상치 못한 응답 형식 수신: {latest_response_part}"
 
+            print(
+                f"[DEBUG] Returning from process_query. final_text_parts: {final_text_parts}"
+            )
             return "\n".join(final_text_parts)
 
         except Exception as e:

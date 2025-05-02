@@ -1,1033 +1,776 @@
 import os
-import queue
 import traceback
-from .app_config import NO_PROMPT_OPTION
-from typing import TYPE_CHECKING, Optional
-
-from PyQt6.QtCore import (
-    Qt,
-    QTimer,
-    pyqtSlot,
-    QEvent,
-    QUrl,
-)
-from PyQt6.QtGui import (
-    QGuiApplication,
-    QTextCursor,
-    QDesktopServices,
-    QKeySequence,
-)
+import queue
 from PyQt6.QtWidgets import (
-    QComboBox,
-    QFileDialog,
-    QHBoxLayout,
-    QLabel,
-    QListWidget,
-    QListWidgetItem,
+    QApplication,
     QMainWindow,
-    QMessageBox,
-    QPushButton,
-    QSizePolicy,
     QTextEdit,
-    QTextBrowser,
+    QLineEdit,
+    QPushButton,
     QVBoxLayout,
     QWidget,
-    QFrame,
+    QHBoxLayout,
+    QComboBox,
+    QLabel,
+    QFileDialog,
+    QListWidget,
+    QListWidgetItem,
+    QSizePolicy,
     QSpacerItem,
 )
-
-if TYPE_CHECKING:
-    from .app_controller import AppController
+from PyQt6.QtGui import (
+    QTextCursor,
+    QColor,
+    QAction,
+    QKeySequence,
+    QTextBlockFormat,
+    QTextCharFormat,
+    QColor,
+    QFont,
+)
+from PyQt6.QtCore import (
+    Qt,
+    pyqtSignal,
+    QThread,
+    QSize,
+    QTimer,
+    QUrl,
+)
 from PyQt6.QtGui import QKeyEvent
 
 
-class PasteAwareTextEdit(QTextEdit):
-    def __init__(self, gui_instance: "ChatGUI", parent=None):
+class ChatInputLineEdit(QLineEdit):
+    """파일 붙여넣기 기능을 지원하는 QLineEdit"""
+
+    file_pasted = pyqtSignal(list)
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.gui = gui_instance
+        print("[DEBUG] ChatInputLineEdit initialized")
 
     def keyPressEvent(self, event: QKeyEvent):
-        """키 입력 이벤트를 재정의하여 붙여넣기 처리"""
+        """키 입력 이벤트 처리 (붙여넣기 감지)"""
         if event.matches(QKeySequence.StandardKey.Paste):
-            print("--- PasteAwareTextEdit: Paste key detected ---")
-            self.gui._handle_paste_shortcut()
-            event.accept()
+            print("[DEBUG] Paste event detected in ChatInputLineEdit")
+            clipboard = QApplication.clipboard()
+            mime_data = clipboard.mimeData()
+
+            if mime_data.hasUrls():
+                print("[DEBUG] Clipboard has URLs (potential files)")
+                file_paths = []
+                for url in mime_data.urls():
+                    if url.isLocalFile():
+                        file_paths.append(url.toLocalFile())
+                if file_paths:
+                    print(
+                        f"[DEBUG] Emitting file_pasted signal with paths: {file_paths}"
+                    )
+                    self.file_pasted.emit(file_paths)
+                    event.accept()
+                    return
+                else:
+                    print(
+                        "[DEBUG] URLs are not local files, proceeding with default paste."
+                    )
+            else:
+                print(
+                    "[DEBUG] Clipboard does not contain URLs, proceeding with default paste."
+                )
+            super().keyPressEvent(event)
         else:
             super().keyPressEvent(event)
 
 
 STYLESHEET = """
+QWidget {
+    background-color: #2E2E2E; /* 전체 배경색 */
+    color: #E0E0E0; /* 기본 텍스트 색상 */
+    font-family: "Malgun Gothic", sans-serif; /* 기본 폰트 */
+    font-size: 14pt; /* 기본 폰트 크기 증가 */
+}
+
 QMainWindow {
-    background-color: #f0f0f0; /* 밝은 회색 배경 */
+    background-color: #2E2E2E;
 }
 
-QWidget#centralWidget {
-    background-color: #ffffff; /* 흰색 배경 */
-    border-radius: 8px; /* 약간 줄인 모서리 둥글기 */
-}
-
-QLabel {
-    font-size: 10pt;
-    color: #333; /* 어두운 회색 텍스트 */
-}
-
-QLabel#statusLabel {
-    font-size: 9pt;
-    color: #555; /* 약간 더 밝은 회색 */
-    padding: 5px 10px; /* 좌우 패딩 추가 */
-    border-top: 1px solid #e0e0e0; /* 상단 구분선 */
-    min-height: 25px; /* 최소 높이 */
-}
-QLabel#statusLabel[thinking="true"] { /* 'thinking' 속성 추가 */
-    font-style: italic;
-    color: #3498db; /* 파란색 */
-}
-
-QLabel#recordingStatusLabel {
-    color: #e74c3c; /* 빨간색 */
-    font-weight: bold;
-    font-size: 10pt;
-    padding-left: 10px; /* 왼쪽 패딩 */
-}
-
-QComboBox {
-    padding: 6px 10px; /* 패딩 조정 */
-    border: 1px solid #ccc;
-    border-radius: 4px;
-    background-color: #fff;
-    min-height: 28px; /* 높이 조정 */
-    font-size: 10pt;
-}
-QComboBox::drop-down {
-    border: none;
-    width: 20px; /* 드롭다운 버튼 영역 너비 */
-}
-QComboBox::down-arrow {
-    /* 아이콘 사용 대신 기본 화살표 사용 */
-}
-QComboBox:focus {
-    border-color: #3498db; /* 파란색 테두리 */
-    outline: none; /* 시스템 기본 포커스 테두리 제거 */
-}
-
-QTextEdit {
-    border: 1px solid #ccc;
-    border-radius: 4px;
-    padding: 8px;
-    background-color: #fff;
-    font-size: 10pt;
-    color: #333;
-}
-QTextEdit#requestEntry {
-    min-height: 80px; /* 최소 높이 설정 */
-}
+/* QTextEdit (응답 영역) */
 QTextEdit#responseArea {
-    background-color: #f8f9fa; /* 약간 다른 배경색 (더 밝게) */
-    border: 1px solid #e9ecef; /* 더 연한 테두리 */
-}
-QTextEdit:focus {
-    border-color: #3498db; /* 파란색 테두리 */
-    outline: none;
+    background-color: #3C3C3C; /* 응답 영역 배경 */
+    color: #E0E0E0;
+    border: 1px solid #555555; /* 테두리 */
+    border-radius: 8px; /* 둥근 모서리 */
+    padding: 8px; /* 내부 여백 */
 }
 
+/* QLineEdit (입력 영역) */
+QLineEdit#requestEntry {
+    background-color: #3C3C3C; /* 입력 필드 배경 */
+    color: #E0E0E0;
+    border: 1px solid #555555;
+    border-radius: 15px; /* 둥근 모서리 */
+    padding: 8px 15px; /* 내부 여백 (좌우 더 넓게) */
+    min-height: 20px; /* 최소 높이 */
+}
+
+QLineEdit#requestEntry:focus {
+    border: 1px solid #77A4EE; /* 포커스 시 테두리 색상 */
+}
+
+/* QPushButton (기본 버튼) */
 QPushButton {
-    background-color: #3498db; /* 파란색 배경 */
-    color: white;
-    border: none;
-    padding: 8px 15px;
-    border-radius: 4px;
-    font-size: 10pt;
-    min-height: 30px; /* 높이 조정 */
-    outline: none; /* 포커스 테두리 제거 */
+    background-color: #555555; /* 버튼 배경 */
+    color: #E0E0E0;
+    border: 1px solid #666666;
+    border-radius: 5px; /* 살짝 둥근 모서리 */
+    padding: 8px 12px; /* 내부 여백 */
+    min-width: 60px; /* 최소 너비 */
 }
+
 QPushButton:hover {
-    background-color: #2980b9; /* 약간 어두운 파란색 */
+    background-color: #666666; /* 호버 시 배경 */
+    border: 1px solid #777777;
 }
+
 QPushButton:pressed {
-    background-color: #1f618d; /* 더 어두운 파란색 */
-}
-QPushButton:disabled {
-    background-color: #bdc3c7; /* 비활성화 시 회색 */
-    color: #7f8c8d;
+    background-color: #444444; /* 클릭 시 배경 */
 }
 
-/* 보조 버튼 스타일 */
-QPushButton#attachButton, QPushButton#sttButton, QPushButton#newChatButton {
-    background-color: #ecf0f1; /* 밝은 회색 배경 */
-    color: #34495e; /* 어두운 파란색 텍스트 */
-    border: 1px solid #bdc3c7;
-}
-QPushButton#attachButton:hover, QPushButton#sttButton:hover, QPushButton#newChatButton:hover {
-    background-color: #dadedf;
-    border-color: #a0a6a8;
-}
-QPushButton#attachButton:pressed, QPushButton#sttButton:pressed, QPushButton#newChatButton:pressed {
-    background-color: #c8cdcf;
-}
-QPushButton#attachButton:disabled, QPushButton#sttButton:disabled, QPushButton#newChatButton:disabled {
-    background-color: #f4f6f6;
-    color: #bdc3c7;
-    border-color: #e0e0e0;
+/* 아이콘 버튼 스타일 (전송, 음성) */
+QPushButton#sendButton, QPushButton#sttButton {
+    background-color: #4A4A4A;
+    border: 1px solid #666666;
+    border-radius: 18px; /* 원형에 가까운 둥근 모서리 */
+    min-width: 36px;
+    max-width: 36px;
+    min-height: 36px;
+    max-height: 36px;
+    padding: 0px; /* 아이콘만 표시될 것이므로 패딩 제거 */
+    /* 아이콘 설정은 코드에서 진행 */
 }
 
+QPushButton#sendButton:hover, QPushButton#sttButton:hover {
+    background-color: #5A5A5A;
+}
+
+QPushButton#sendButton:pressed, QPushButton#sttButton:pressed {
+    background-color: #3A3A3A;
+}
+
+/* QPushButton (파일 첨부 버튼) */
+QPushButton#attachButton {
+    background-color: #4A4A4A;
+    border: 1px solid #666666;
+    border-radius: 18px; /* 원형에 가까운 둥근 모서리 */
+    min-width: 36px;
+    max-width: 36px;
+    min-height: 36px;
+    max-height: 36px;
+    padding: 0px;
+    font-size: 14pt; /* 아이콘 크기 조정 */
+}
+
+QPushButton#attachButton:hover {
+    background-color: #5A5A5A;
+}
+
+QPushButton#attachButton:pressed {
+    background-color: #3A3A3A;
+}
+
+/* QListWidget (첨부 파일 목록) */
 QListWidget#attachmentListWidget {
-    border: 1px solid #ccc;
-    border-radius: 4px;
-    background-color: #f8f9fa; /* responseArea와 동일하게 */
-    font-size: 9pt;
+    background-color: #3C3C3C;
+    border: 1px solid #555555;
+    border-radius: 8px;
     padding: 5px;
-    max-height: 80px; /* 최대 높이 제한 */
+    /* max-height 제거 또는 주석 처리 - 고정 높이 사용 */
+    /* max-height: 60px; */
 }
+
 QListWidget#attachmentListWidget::item {
-    padding: 4px 6px; /* 아이템 패딩 조정 */
-    color: #333;
-}
-QListWidget#attachmentListWidget::item:hover {
-    background-color: #e9ecef; /* 연한 회색 배경 */
-    border-radius: 3px;
+    color: #D0D0D0;
+    padding: 3px 5px;
+    margin: 2px 0;
+    border-radius: 4px;
 }
 
-QFrame#attachmentFrame {
-    /* border-top: 1px solid #e0e0e0; */ /* 구분선 제거, statusLabel이 대신 함 */
-    padding-top: 5px; /* 위쪽 여백 */
+QListWidget#attachmentListWidget::item:selected {
+    background-color: #555555; /* 선택 시 배경 */
+    color: #FFFFFF;
 }
 
-/* 채팅 메시지 스타일 */
-QTextEdit#responseArea p {
-    margin-bottom: 8px; /* 단락 간 간격 */
-    line-height: 1.4; /* 줄 간격 */
+/* QScrollBar 스타일 */
+QScrollBar:vertical {
+    border: none;
+    background: #3C3C3C; /* 스크롤바 배경 */
+    width: 10px; /* 스크롤바 너비 */
+    margin: 0px 0px 0px 0px;
 }
-QTextEdit#responseArea b { /* User, AI 레이블 */
-    color: #2c3e50; /* 약간 어두운 파란색/회색 */
+
+QScrollBar::handle:vertical {
+    background: #666666; /* 스크롤바 핸들 색상 */
+    min-height: 20px; /* 핸들 최소 높이 */
+    border-radius: 5px; /* 핸들 둥근 모서리 */
 }
-QTextEdit#responseArea i { /* System 메시지 */
-    color: #7f8c8d; /* 회색 */
+
+QScrollBar::handle:vertical:hover {
+    background: #777777; /* 호버 시 핸들 색상 */
 }
-QTextEdit#responseArea a { /* 링크 스타일 */
-    color: #3498db;
-    text-decoration: none;
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    border: none;
+    background: none;
+    height: 0px;
 }
-QTextEdit#responseArea a:hover {
-    text-decoration: underline;
+
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: none;
+}
+
+QScrollBar:horizontal {
+    border: none;
+    background: #3C3C3C;
+    height: 10px;
+    margin: 0px 0px 0px 0px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #666666;
+    min-width: 20px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: #777777;
+}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    border: none;
+    background: none;
+    width: 0px;
+}
+
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: none;
 }
 """
 
 
-class ChatGUI(QMainWindow):
-    def __init__(self, controller: "AppController"):
+class BongchunAgentGUI(QMainWindow):
+    """메인 GUI 창 클래스"""
+
+    def __init__(self, client, prompt_manager, hotkey_manager, app_controller):
         super().__init__()
-        self.controller = controller
-        self.response_queue = self.controller.response_queue
-        self.hotkey_manager = self.controller.hotkey_manager
+        self.client = client
+        self.prompt_manager = prompt_manager
+        self.hotkey_manager = hotkey_manager
+        self.app_controller = app_controller
+        self.attached_files = []
+        self.processing_message_block = None
+        print("[DEBUG] BongchunAgentGUI initialized")
 
-        self.prompt_dropdown: Optional[QComboBox] = None
-        self.request_entry: Optional[QTextEdit] = None
-        self.send_button: Optional[QPushButton] = None
-        self.new_chat_button: Optional[QPushButton] = None
-        self.stt_button: Optional[QPushButton] = None
-        self.attach_button: Optional[QPushButton] = None
-        self.response_area: Optional[QTextBrowser] = None
-        self.status_label: Optional[QLabel] = None
-        self.recording_status_label: Optional[QLabel] = None
-        self.attachment_list_widget: Optional[QListWidget] = None
-        self.attachment_frame: Optional[QFrame] = None
-        self.queue_timer: Optional[QTimer] = None
-
-        self._init_ui()
-        self._setup_timer()
-        self._setup_shortcuts()
-        self._connect_hotkey_signals()
-        self.apply_styles()
-
-        if self.controller.prompt_manager.available_prompts and self.prompt_dropdown:
-            self.prompt_dropdown.setCurrentIndex(0)
-            self._on_prompt_select()
-
-        self.update_status("대기 중")
-
-    def _init_ui(self):
-        """GUI 위젯 생성 및 배치 (4단계: 최종)"""
-        self.setWindowTitle("AI Agent Chat")
-        self.setGeometry(100, 100, 650, 650)
-
-        central_widget = QWidget(self)
-        central_widget.setObjectName("centralWidget")
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(15, 15, 15, 10)
-        main_layout.setSpacing(10)
-
-        prompt_layout = QHBoxLayout()
-        prompt_label = QLabel("추가 프롬프트:")
-        self.prompt_dropdown = QComboBox()
-        self.prompt_dropdown.addItems(self.controller.prompt_manager.available_prompts)
-        self.prompt_dropdown.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
-        self.prompt_dropdown.currentIndexChanged.connect(self._on_prompt_select)
-        prompt_layout.addWidget(prompt_label)
-        prompt_layout.addWidget(self.prompt_dropdown)
-        main_layout.addLayout(prompt_layout)
-
-        self.response_area = QTextBrowser()
-        self.response_area.setObjectName("responseArea")
-        self.response_area.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        self.response_area.anchorClicked.connect(self._handle_anchor_clicked)
-        main_layout.addWidget(self.response_area, 1)
-
-        input_frame = QFrame()
-        input_frame_layout = QVBoxLayout(input_frame)
-        input_frame_layout.setContentsMargins(0, 5, 0, 0)
-        input_frame_layout.setSpacing(5)
-
-        self.request_entry = PasteAwareTextEdit(self)
-        self.request_entry.setObjectName("requestEntry")
-        self.request_entry.setPlaceholderText(
-            "여기에 요청을 입력하세요... (Shift+Enter로 줄바꿈)"
-        )
-        self.request_entry.setFixedHeight(100)
-        self.request_entry.installEventFilter(self)
-        input_frame_layout.addWidget(self.request_entry)
-
-        action_layout = QHBoxLayout()
-        action_layout.setSpacing(8)
-
-        button_group_layout = QHBoxLayout()
-        button_group_layout.setSpacing(8)
-
-        self.attach_button = QPushButton("파일 첨부")
-        self.attach_button.setObjectName("attachButton")
-        self.attach_button.setToolTip(
-            "파일을 첨부합니다 (Ctrl+V 또는 드래그앤드롭 가능)"
-        )
-        self.attach_button.clicked.connect(self._attach_file_handler)
-        button_group_layout.addWidget(self.attach_button)
-
-        if self.controller.stt_service:
-            self.stt_button = QPushButton("음성 입력")
-            self.stt_button.setObjectName("sttButton")
-            self.stt_button.setToolTip("음성으로 요청을 입력합니다 (단축키 지원)")
-            self.stt_button.clicked.connect(self._voice_input_handler)
-            button_group_layout.addWidget(self.stt_button)
-        else:
-            self.stt_button = None
-
-        self.new_chat_button = QPushButton("새 채팅")
-        self.new_chat_button.setObjectName("newChatButton")
-        self.new_chat_button.setToolTip("현재 채팅 내용을 지우고 새로 시작합니다.")
-        self.new_chat_button.clicked.connect(self._start_new_chat_handler)
-        button_group_layout.addWidget(self.new_chat_button)
-
-        action_layout.addLayout(button_group_layout)
-        action_layout.addSpacerItem(
-            QSpacerItem(
-                40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
-            )
-        )
-
-        self.send_button = QPushButton("전송")
-        self.send_button.setObjectName("sendButton")
-        self.send_button.setToolTip("입력된 요청을 전송합니다 (Enter)")
-        self.send_button.clicked.connect(self._send_prompt_handler)
-        action_layout.addWidget(self.send_button)
-
-        input_frame_layout.addLayout(action_layout)
-        main_layout.addWidget(input_frame)
-
-        self.attachment_frame = QFrame()
-        self.attachment_frame.setObjectName("attachmentFrame")
-        attachment_layout = QVBoxLayout(self.attachment_frame)
-        attachment_layout.setContentsMargins(0, 0, 0, 0)
-        attachment_layout.setSpacing(5)
-
-        attachment_label = QLabel("첨부된 파일:")
-        attachment_layout.addWidget(attachment_label)
-
-        self.attachment_list_widget = QListWidget()
-        self.attachment_list_widget.setObjectName("attachmentListWidget")
-        self.attachment_list_widget.setStyleSheet("font-size: 9pt;")
-        self.attachment_list_widget.itemDoubleClicked.connect(
-            self._handle_attachment_double_click
-        )
-        attachment_layout.addWidget(self.attachment_list_widget)
-        self.attachment_frame.hide()
-        main_layout.addWidget(self.attachment_frame)
-
-        status_bar_layout = QHBoxLayout()
-        status_bar_layout.setContentsMargins(0, 5, 0, 0)
-
-        self.status_label = QLabel("대기 중")
-        self.status_label.setObjectName("statusLabel")
-        self.status_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
-        status_bar_layout.addWidget(self.status_label)
-
-        self.recording_status_label = QLabel("")
-        self.recording_status_label.setObjectName("recordingStatusLabel")
-        self.recording_status_label.hide()
-        status_bar_layout.addWidget(self.recording_status_label)
-
-        main_layout.addLayout(status_bar_layout)
-
-        self.request_entry.setFocus()
-
-    def apply_styles(self):
-        """애플리케이션에 스타일시트 적용"""
+        self.setWindowTitle("봉춘 로컬 에이전트")
+        self.setGeometry(100, 100, 700, 800)
         self.setStyleSheet(STYLESHEET)
 
-    @pyqtSlot()
-    def _on_prompt_select(self):
-        """프롬프트 콤보박스 선택 변경 시 호출될 슬롯"""
-        if not self.prompt_dropdown:
-            return
-        selected_display = self.prompt_dropdown.currentText()
-        if selected_display == NO_PROMPT_OPTION:
-            self.setWindowTitle("AI Agent Chat (Prompt: None)")
-        else:
-            self.setWindowTitle(f"AI Agent Chat (Prompt: {selected_display})")
+        self._init_ui()
+        self._connect_signals()
+        self._setup_hotkeys()
 
-    def eventFilter(self, source, event):
-        """request_entry에서 Enter 및 Shift+Enter 키 처리"""
-        if source is self.request_entry and event.type() == QEvent.Type.KeyPress:
-            key = event.key()
-            modifiers = event.modifiers()
-
-            if key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
-                if modifiers == Qt.KeyboardModifier.ShiftModifier:
-                    self.request_entry.insertPlainText("\n")
-                    return True
-                else:
-                    if self.send_button and self.send_button.isEnabled():
-                        self._send_prompt_handler()
-                    return True
-        return super().eventFilter(source, event)
-
-    def _setup_timer(self):
-        """큐 확인을 위한 타이머 설정"""
+        # 응답 큐 처리를 위한 타이머 설정
         self.queue_timer = QTimer(self)
-        self.queue_timer.timeout.connect(self._check_queue)
+        self.queue_timer.timeout.connect(self._process_response_queue)
         self.queue_timer.start(100)
+        print("[DEBUG] Response queue timer started.")
 
-    def _connect_hotkey_signals(self):
-        """HotkeyManager의 시그널을 GUI 슬롯에 연결합니다."""
-        if self.hotkey_manager:
-            try:
-                self.hotkey_manager.activate_signal.connect(
-                    self._voice_input_handler_wrapper
-                )
-                self.hotkey_manager.show_window_signal.connect(
-                    self._toggle_window_visibility
-                )
-                print("GUI: HotkeyManager 시그널 (음성, 창 토글) 연결 완료.")
-            except AttributeError as e:
-                print(f"GUI 경고: HotkeyManager 시그널 연결 중 오류 발생 - {e}.")
-            except Exception as e:
-                print(f"GUI 오류: HotkeyManager 시그널 연결 중 예기치 않은 오류: {e}")
-        else:
+    def _init_ui(self):
+        """UI 요소 초기화 및 배치"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(10)
+
+        # --- 응답 영역 ---
+        self.responseArea = QTextEdit()
+        self.responseArea.setObjectName("responseArea")
+        self.responseArea.setReadOnly(True)
+        self.responseArea.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        main_layout.addWidget(self.responseArea, 1)
+
+        # --- 프롬프트 선택 영역 ---
+        prompt_layout = QHBoxLayout()
+        prompt_label = QLabel("프롬프트:")
+        self.promptComboBox = QComboBox()
+        self.promptComboBox.setObjectName("promptComboBox")
+        prompt_layout.addWidget(prompt_label)
+        prompt_layout.addWidget(self.promptComboBox, 1)
+
+        # 새 대화 버튼 추가
+        self.newChatButton = QPushButton("새 대화")
+        self.newChatButton.setObjectName("newChatButton")
+        self.newChatButton.setToolTip("새로운 대화를 시작합니다 (Ctrl+N)")
+        prompt_layout.addWidget(self.newChatButton)
+
+        main_layout.addLayout(prompt_layout)
+
+        # 프롬프트 목록 로드
+        try:
+            from .app_config import (
+                NO_PROMPT_OPTION,
+            )
+
+            available_prompts = self.prompt_manager.available_prompts
+            print(f"[DEBUG] Available prompts from attribute: {available_prompts}")
+            self.promptComboBox.addItems(available_prompts)
+            if NO_PROMPT_OPTION in available_prompts:
+                self.promptComboBox.setCurrentText(NO_PROMPT_OPTION)
+            elif available_prompts:
+                self.promptComboBox.setCurrentIndex(0)
+
+        except AttributeError:
             print(
-                "GUI 경고: HotkeyManager 인스턴스가 없어 시그널을 연결할 수 없습니다."
+                "[DEBUG] Error: prompt_manager does not have 'available_prompts' attribute or it's not ready."
             )
+            traceback.print_exc()
+            self.promptComboBox.addItem("오류: 프롬프트 속성 접근 불가")
+            self.promptComboBox.setEnabled(False)
+        except Exception as e:
+            print(f"[DEBUG] Error loading prompts: {e}")
+            traceback.print_exc()
+            self.promptComboBox.addItem("오류: 프롬프트 로드 실패")
+            self.promptComboBox.setEnabled(False)
 
-    @pyqtSlot()
-    def _send_prompt_handler(self):
-        """전송 버튼 클릭 또는 Enter 키 입력 시 호출될 슬롯"""
-        if (
-            not self.request_entry
-            or not self.send_button
-            or not self.send_button.isEnabled()
-        ):
-            return
+        # --- 하단 입력 영역 ---
+        input_layout = QHBoxLayout()
+        input_layout.setSpacing(8)
 
-        user_request = self.request_entry.toPlainText().strip()
-        if not user_request and not self.controller.get_attachment_paths():
-            self.update_status(
-                "오류: 요청 내용 또는 첨부 파일이 필요합니다.", is_thinking=False
-            )
-            QTimer.singleShot(2000, lambda: self.update_status("대기 중"))
-            return
+        # --- 첨부 파일 목록 (응답 영역 아래, 입력 영역 위) ---
+        self.attachmentListWidget = QListWidget()
+        self.attachmentListWidget.setObjectName("attachmentListWidget")
+        self.attachmentListWidget.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.attachmentListWidget.setFixedHeight(40)
+        self.attachmentListWidget.setVisible(False)
+        # Flow layout 설정 (가로 스크롤)
+        self.attachmentListWidget.setFlow(QListWidget.Flow.LeftToRight)
+        self.attachmentListWidget.setWrapping(False)
+        self.attachmentListWidget.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.attachmentListWidget.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
 
-        self.request_entry.clear()
-        self._disable_buttons()
-        self.update_status("요청 처리 중...", is_thinking=True)
+        main_layout.addWidget(self.attachmentListWidget, 0)
 
-        additional_prompt = ""
-        if self.prompt_dropdown:
-            additional_prompt = self.controller.prompt_manager.load_selected_prompt(
-                self.prompt_dropdown.currentText()
-            )
+        # --- 하단 입력 영역 ---
+        input_layout = QHBoxLayout()
+        input_layout.setSpacing(8)
 
-        self.controller.process_user_request(user_request, additional_prompt)
+        # 파일 첨부 버튼 (왼쪽)
+        self.attachButton = QPushButton("📎")
+        self.attachButton.setObjectName("attachButton")
+        self.attachButton.setToolTip("파일 첨부")
+        # 아이콘 크기 등 스타일은 스타일시트에서 설정
+        input_layout.addWidget(self.attachButton, 0)
 
-    @pyqtSlot()
-    def _attach_file_handler(self):
-        """파일 첨부 버튼 클릭 시 호출될 슬롯"""
-        if not self.attach_button or not self.attach_button.isEnabled():
-            return
+        # 텍스트 입력 필드 (중앙) - 커스텀 위젯 사용
+        self.requestEntry = ChatInputLineEdit()
+        self.requestEntry.setObjectName("requestEntry")
+        self.requestEntry.setPlaceholderText("Gemini에게 물어보기 (파일 붙여넣기 가능)")
+        self.requestEntry.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        input_layout.addWidget(self.requestEntry, 1)
 
-        file_filter = "모든 파일 (*.*);;이미지 파일 (*.png *.jpg *.jpeg *.gif *.bmp *.tiff *.webp);;텍스트 파일 (*.txt *.md *.py *.js *.html *.css)"
-        filepaths, _ = QFileDialog.getOpenFileNames(self, "파일 선택", "", file_filter)
-        if filepaths:
-            attached_count = 0
-            failed_count = 0
-            for filepath in filepaths:
-                try:
-                    if self.controller.attach_file(filepath):
-                        attached_count += 1
-                        print(f"GUI: 파일 첨부됨 - {os.path.basename(filepath)}")
-                    else:
-                        failed_count += 1
-                        print(
-                            f"GUI: 파일 첨부 실패(중복 등) - {os.path.basename(filepath)}"
-                        )
-                except Exception as e:
-                    failed_count += 1
-                    print(
-                        f"GUI Error: 파일 첨부 버튼 처리 중 오류 발생 - {filepath}: {e}"
-                    )
-                    traceback.print_exc()
+        self.sttButton = QPushButton("🎤")
+        self.sttButton.setObjectName("sttButton")
+        self.sttButton.setToolTip("음성으로 입력 (단축키: Ctrl+Shift+S)")
+        input_layout.addWidget(self.sttButton, 0)
 
-            if attached_count > 0:
-                self._update_attachment_list()
-                status_msg = f"{attached_count}개 파일 첨부 완료."
-                if failed_count > 0:
-                    status_msg += f" ({failed_count}개 실패)"
-                self.update_status(status_msg)
-                QTimer.singleShot(3000, lambda: self.update_status("대기 중"))
-            elif failed_count > 0:
-                self.update_status(f"{failed_count}개 파일 첨부 실패.")
-                QTimer.singleShot(3000, lambda: self.update_status("대기 중"))
+        # 전송 버튼 (오른쪽)
+        self.sendButton = QPushButton("➤")
+        self.sendButton.setObjectName("sendButton")
+        self.sendButton.setToolTip("전송 (Enter)")
+        input_layout.addWidget(self.sendButton, 0)
 
+        main_layout.addLayout(input_layout)
+
+        # --- 메뉴바 ---
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("파일")
+
+        # 새 대화 시작 액션 추가
+        self.new_chat_action = QAction("새 대화 시작", self)
+        self.new_chat_action.setShortcut(QKeySequence("Ctrl+N"))
+        file_menu.addAction(self.new_chat_action)
+
+        file_menu.addSeparator()
+
+        # 종료 액션 추가
+        exit_action = QAction("종료", self)
+        exit_action.setShortcut(QKeySequence("Ctrl+Q"))
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        print("[DEBUG] UI initialized with menubar")
+
+    def _connect_signals(self):
+        """시그널과 슬롯 연결"""
+        self.sendButton.clicked.connect(self._send_request)
+        self.requestEntry.returnPressed.connect(self._send_request)
+        self.sttButton.clicked.connect(self._start_stt)
+        self.attachButton.clicked.connect(self._attach_file)
+        self.attachmentListWidget.itemDoubleClicked.connect(self._remove_attachment)
+        self.requestEntry.file_pasted.connect(self._handle_pasted_files)
+        self.new_chat_action.triggered.connect(self._start_new_chat)
+        self.newChatButton.clicked.connect(self._start_new_chat)
+
+        if self.hotkey_manager:
+            print("[DEBUG] Connecting hotkey_manager signals...")
+            try:
+                self.hotkey_manager.show_window_signal.connect(self._toggle_window)
+                print("[DEBUG] show_window_signal connected to _toggle_window")
+                self.hotkey_manager.activate_signal.connect(self._start_stt)
+                print("[DEBUG] activate_signal connected to _start_stt")
+            except AttributeError as e:
+                print(
+                    f"[DEBUG] Error connecting hotkey signals: {e} - HotkeyManager or signals might not be ready."
+                )
+            except Exception as e:
+                print(f"[DEBUG] Unexpected error connecting hotkey signals: {e}")
+                traceback.print_exc()
         else:
-            print("GUI: 파일 선택 취소됨.")
+            print("[DEBUG] HotkeyManager not available, skipping signal connection.")
 
-    @pyqtSlot()
-    def _voice_input_handler(self):
-        """음성 입력 버튼 클릭 시 호출될 슬롯"""
-        if self.stt_button and self.stt_button.isEnabled():
-            self._disable_buttons()
-            self.update_status("음성 입력 준비 중...", is_thinking=True)
-            self.controller.handle_voice_input()
+        print("[DEBUG] Signals connected")
 
-    @pyqtSlot()
-    def _voice_input_handler_wrapper(self):
-        """음성 입력 단축키 처리 슬롯"""
-        print("음성 입력 단축키 핸들러 호출됨")
-        if (
-            self.controller.stt_service
-            and self.stt_button
-            and self.stt_button.isEnabled()
-        ):
-            if not self.isVisible():
-                self.show()
-            self.bring_to_front()
-            self._voice_input_handler()
-        else:
-            print("음성 입력 단축키: STT 서비스 비활성화 또는 버튼 비활성 상태")
-            self.update_status("음성 입력을 사용할 수 없습니다.", is_thinking=False)
-            QTimer.singleShot(2000, lambda: self.update_status("대기 중"))
+    def _setup_hotkeys(self):
+        """전역 단축키 설정 (AppController에서 처리하므로 내용은 비움)"""
+        print("[DEBUG] _setup_hotkeys called (registration handled by AppController).")
 
-    @pyqtSlot()
-    def _toggle_window_visibility(self):
-        """창 보이기/숨기기 토글 슬롯"""
-        print("GUI: 창 표시/숨김 토글 단축키 핸들러 호출됨")
+    def _toggle_window(self):
+        """창 보이기/숨기기 토글 (AppController의 HotkeyManager가 호출)"""
         if self.isVisible():
-            print("GUI: 창 숨김.")
             self.hide()
         else:
-            print("GUI: 창 표시 및 앞으로 가져오기.")
             self.show()
-            self.bring_to_front()
+            self.activateWindow()
+            self.requestEntry.setFocus()
 
-    @pyqtSlot()
-    def _handle_paste_shortcut(self):
-        """PyQt 단축키(Cmd+V/Ctrl+V)로 인한 붙여넣기 처리 슬롯"""
-        print("--- GUI DEBUG: _handle_paste_shortcut SLOT CALLED ---")
-        print("GUI DEBUG: _handle_paste_shortcut called (PyQt Shortcut).")
-
-        self._process_clipboard_paste()
-
-    @pyqtSlot()
-    def _handle_global_paste(self):
-        """붙여넣기 (전역 단축키 - pynput) 처리 슬롯 (이제 사용되지 않음, 혹시 모르니 남겨둠)"""
-        print("GUI DEBUG: _handle_global_paste called (Global Hotkey - likely unused).")
-        if not self.isVisible():
-            self.show()
-        self.bring_to_front()
-
-        clipboard = QGuiApplication.clipboard()
-        mime_data = clipboard.mimeData()
-        processed = False
-        attached_files_count = 0
-
-        if mime_data.hasUrls():
-            print("GUI DEBUG: Clipboard has URLs.")
-            for url in mime_data.urls():
-                if url.isLocalFile():
-                    filepath = url.toLocalFile()
-                    print(f"GUI DEBUG: Processing local file URL: {filepath}")
-                    if os.path.exists(filepath):
-                        try:
-                            if self.controller.attach_file(filepath):
-                                print(f"GUI: Successfully attached file: {filepath}")
-                                attached_files_count += 1
-                                processed = True
-                            else:
-                                print(
-                                    f"GUI WARNING: Controller failed to attach file: {filepath}"
-                                )
-                        except Exception as e:
-                            print(f"GUI ERROR: Error attaching file {filepath}: {e}")
-                            self.update_status(
-                                f"오류: 파일 첨부 실패 - {os.path.basename(filepath)}"
-                            )
-                            QTimer.singleShot(
-                                3000, lambda: self.update_status("대기 중")
-                            )
-                    else:
-                        print(
-                            f"GUI WARNING: File path from URL does not exist: {filepath}"
-                        )
-                else:
-                    print(f"GUI DEBUG: Skipping non-local URL: {url.toString()}")
-
-        elif mime_data.hasText() and self.request_entry:
-            print("GUI DEBUG: Clipboard has text.")
-            pasted_text = mime_data.text().strip()
-            print(f"GUI DEBUG: Pasted text (first 100 chars): {pasted_text[:100]!r}")
-
-            if os.path.exists(pasted_text):
-                print(f"GUI DEBUG: Pasted text is an existing file path: {pasted_text}")
-                try:
-                    if self.controller.attach_file(pasted_text):
-                        print(
-                            f"GUI: Successfully attached file from text path: {pasted_text}"
-                        )
-                        attached_files_count += 1
-                        processed = True
-                    else:
-                        print(
-                            f"GUI WARNING: Controller failed to attach file from text path: {pasted_text}"
-                        )
-                        self.request_entry.insertPlainText(pasted_text)
-                        print("GUI: Pasting as plain text after attachment failure.")
-                        processed = True
-                except Exception as e:
-                    print(
-                        f"GUI ERROR: Error attaching file from text path {pasted_text}: {e}"
-                    )
-                    self.update_status(
-                        f"오류: 파일 첨부 실패 - {os.path.basename(pasted_text)}"
-                    )
-                    QTimer.singleShot(3000, lambda: self.update_status("대기 중"))
-                    self.request_entry.insertPlainText(pasted_text)
-                    print("GUI: Pasting as plain text after error during attachment.")
-                    processed = True
-            else:
-                self.request_entry.insertPlainText(pasted_text)
-                self.request_entry.moveCursor(QTextCursor.MoveOperation.End)
-                print("GUI: Pasted text into request entry (not a file path).")
-                processed = True
-
-        if attached_files_count > 0:
-            self._update_attachment_list()
-            self.update_status(f"{attached_files_count}개 파일 첨부 완료.")
-            QTimer.singleShot(2000, lambda: self.update_status("대기 중"))
-
-        if not processed:
-            print("GUI DEBUG: No processable data (URLs or text) found in clipboard.")
-            self.update_status("붙여넣기할 내용 없음.")
-            QTimer.singleShot(2000, lambda: self.update_status("대기 중"))
-
-        self._process_clipboard_paste()
-
-    def _process_clipboard_paste(self):
-        """클립보드 내용을 처리하여 붙여넣는 공통 로직"""
-        print("GUI DEBUG: _process_clipboard_paste called.")
-        clipboard = QGuiApplication.clipboard()
-        mime_data = clipboard.mimeData()
-        processed = False
-        attached_files_count = 0
-
-        if mime_data.hasUrls():
-            print("GUI DEBUG: Clipboard has URLs.")
-            for url in mime_data.urls():
-                if url.isLocalFile():
-                    filepath = url.toLocalFile()
-                    print(f"GUI DEBUG: Processing local file URL: {filepath}")
-                    if os.path.exists(filepath):
-                        try:
-                            if self.controller.attach_file(filepath):
-                                print(f"GUI: Successfully attached file: {filepath}")
-                                attached_files_count += 1
-                                processed = True
-                            else:
-                                print(
-                                    f"GUI WARNING: Controller failed to attach file: {filepath}"
-                                )
-                        except Exception as e:
-                            print(f"GUI ERROR: Error attaching file {filepath}: {e}")
-                            self.update_status(
-                                f"오류: 파일 첨부 실패 - {os.path.basename(filepath)}"
-                            )
-                            QTimer.singleShot(
-                                3000, lambda: self.update_status("대기 중")
-                            )
-                    else:
-                        print(
-                            f"GUI WARNING: File path from URL does not exist: {filepath}"
-                        )
-                else:
-                    print(f"GUI DEBUG: Skipping non-local URL: {url.toString()}")
-
-        elif mime_data.hasText() and self.request_entry:
-            print("GUI DEBUG: Clipboard has text.")
-            pasted_text = mime_data.text().strip()
-            print(f"GUI DEBUG: Pasted text (first 100 chars): {pasted_text[:100]!r}")
-
-            # 1. 텍스트가 유효한 파일 경로인지 먼저 확인
-            if os.path.exists(pasted_text):
-                print(f"GUI DEBUG: Pasted text is an existing file path: {pasted_text}")
-                try:
-                    if self.controller.attach_file(pasted_text):
-                        print(
-                            f"GUI: Successfully attached file from text path: {pasted_text}"
-                        )
-                        attached_files_count += 1
-                        processed = True
-                    else:
-                        print(
-                            f"GUI WARNING: Controller failed to attach file from text path: {pasted_text}"
-                        )
-                        self.update_status(
-                            f"파일 첨부 실패: {os.path.basename(pasted_text)}"
-                        )
-                        QTimer.singleShot(2000, lambda: self.update_status("대기 중"))
-
-                except Exception as e:
-                    print(
-                        f"GUI ERROR: Error attaching file from text path {pasted_text}: {e}"
-                    )
-                    self.update_status(
-                        f"오류: 파일 첨부 실패 - {os.path.basename(pasted_text)}"
-                    )
-                    QTimer.singleShot(3000, lambda: self.update_status("대기 중"))
-
-            # 2. 파일 경로가 아니거나 파일 첨부에 실패했고, request_entry가 포커스 상태이면 텍스트 붙여넣기
-            if not processed and self.request_entry.hasFocus():
-                self.request_entry.insertPlainText(pasted_text)
-                self.request_entry.moveCursor(QTextCursor.MoveOperation.End)
-                print(
-                    "GUI: Pasted text into focused request entry (not a file path or attachment failed)."
-                )
-                processed = True
-            elif not processed:
-                print(
-                    "GUI: Pasted text ignored (not a file path and request entry not focused)."
-                )
-                pass
-
-        if attached_files_count > 0:
-            self._update_attachment_list()
-            self.update_status(f"{attached_files_count}개 파일 첨부 완료.")
-            QTimer.singleShot(2000, lambda: self.update_status("대기 중"))
-
-        if not processed and attached_files_count == 0:
-            print(
-                "GUI DEBUG: No processable data (URLs or text) found or handled in clipboard."
-            )
-
-    def _prompt_for_file(self, initial_filename: str = ""):
-        """파일 선택 대화상자를 열고 선택된 파일을 첨부합니다. (현재 직접 사용되지 않음)"""
-        print(
-            f"GUI DEBUG: _prompt_for_file called (likely unused) with: {initial_filename!r}"
-        )
-        self._attach_file_handler()
-
-    @pyqtSlot()
-    def _start_new_chat_handler(self):
-        """새 채팅 시작 버튼 클릭 시 호출될 슬롯"""
-        if not self.new_chat_button or not self.new_chat_button.isEnabled():
+    def _send_request(self):
+        """사용자 요청 전송"""
+        print("[DEBUG] _send_request called")
+        request_text = self.requestEntry.text().strip()
+        if not request_text and not self.attached_files:
+            print("[DEBUG] No text or files to send.")
             return
-        print("GUI: 새 채팅 시작 버튼 클릭됨")
-        self.controller.start_new_chat_session()
 
-    @pyqtSlot()
-    def _check_queue(self):
-        """컨트롤러의 큐를 주기적으로 확인하여 GUI 업데이트"""
+        selected_prompt = self.promptComboBox.currentText()
+
+        self._append_message(f"나: {request_text}")
+        self._disable_ui_elements()
+        self._append_message("⏳ AI 처리 중...", is_processing=True)
+        self.requestEntry.clear()
+
+        print(
+            "[DEBUG] User message shown, UI disabled, processing message shown, calling app_controller.process_user_request"
+        )
+
+        if self.app_controller:
+            self.app_controller.process_user_request(request_text, selected_prompt)
+        else:
+            print("[DEBUG] Error: AppController not available.")
+            self._append_message(
+                "<font color='red'>오류: AppController가 연결되지 않았습니다.</font>"
+            )
+            self._enable_ui_elements()
+
+    def _enable_ui_elements(self):
+        """UI 입력 요소 활성화"""
+        print("[DEBUG] Enabling UI elements")
+        self.requestEntry.setEnabled(True)
+        self.sendButton.setEnabled(True)
+        self.sttButton.setEnabled(True)
+        self.requestEntry.setFocus()
+
+    def _disable_ui_elements(self):
+        """UI 입력 요소 비활성화"""
+        print("[DEBUG] Disabling UI elements")
+        self.requestEntry.setEnabled(False)
+        self.sendButton.setEnabled(False)
+        self.sttButton.setEnabled(False)
+
+    def _append_message(self, message, is_processing=False):
+        """응답 영역에 메시지 추가 (QTextBlockFormat 및 QTextCharFormat 사용)"""
+        cursor = self.responseArea.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        is_user_message = message.startswith("나:") and not is_processing
+        is_ai_message = message.startswith("Agent:") and not is_processing
+        is_system_message = message.startswith("<font color=") and not is_processing
+
+        if (
+            is_ai_message
+            and self.processing_message_block
+            and self.processing_message_block.isValid()
+        ):
+            print(
+                f"[DEBUG] AI message received. Attempting to remove processing block: {self.processing_message_block.blockNumber()} (valid: {self.processing_message_block.isValid()})"
+            )
+            temp_cursor = QTextCursor(self.processing_message_block)
+            temp_cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+            temp_cursor.removeSelectedText()
+            print(
+                f"[DEBUG] Successfully removed processing message block using stored object: {self.processing_message_block.blockNumber()}"
+            )
+            self.processing_message_block = None
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            print("[DEBUG] Cursor moved to end after attempting removal.")
+
+        block_format = QTextBlockFormat()
+        block_format.setBottomMargin(8)
+
+        char_format = QTextCharFormat()
+        char_format.setFont(self.responseArea.font())
+        char_format.setForeground(QColor("#E0E0E0"))
+
+        message_content = message
+
+        if is_user_message:
+            message_content = message[len("나:") :].strip()
+            block_format.setAlignment(Qt.AlignmentFlag.AlignRight)
+            cursor.insertBlock(block_format)
+            html_content = f"""
+            <div style='display: inline-block; max-width: 80%; color: #FFFFFF;'>
+                {message_content.replace('<', '<').replace('>', '>').replace('\\n', '<br>')}
+            </div>
+            """
+            cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+            cursor.insertHtml(html_content)
+
+        elif is_ai_message:
+            parts = message.split("\n", 1)
+            if len(parts) > 1:
+                prefix = parts[0]
+                content = parts[1].strip()
+                bold_format = QTextCharFormat()
+                bold_format.setFontWeight(QFont.Weight.Bold)
+                cursor.insertBlock(block_format, char_format)
+                cursor.insertText(prefix + "\n", bold_format)
+                cursor.insertText(content)
+            else:
+                message_content = message[len("Agent:") :].strip()
+                cursor.insertBlock(block_format, char_format)
+                cursor.insertText(f"Gemini:\n{message_content}")
+
+            block_format.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        elif is_system_message:
+            cursor.insertHtml(message + "<br>")
+            self.responseArea.ensureCursorVisible()
+            return
+        elif is_processing:
+            print(f"[DEBUG] Appending processing message: '{message}'")
+            if (
+                self.processing_message_block
+                and self.processing_message_block.isValid()
+            ):
+                print(
+                    f"[DEBUG] Removing previous processing block before adding new one: {self.processing_message_block.blockNumber()}"
+                )
+                prev_cursor = QTextCursor(self.processing_message_block)
+                prev_cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+                prev_cursor.removeSelectedText()
+                self.processing_message_block = None
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+
+            message_content = message
+            block_format.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            char_format.setForeground(QColor("#AAAAAA"))
+            cursor.insertBlock(block_format, char_format)
+            cursor.insertText(message_content)
+            self.processing_message_block = cursor.block()
+            print(
+                f"[DEBUG] Stored new processing message block: {self.processing_message_block.blockNumber()} (valid: {self.processing_message_block.isValid()})"
+            )
+        else:
+            block_format.setAlignment(Qt.AlignmentFlag.AlignLeft)
+            cursor.insertBlock(block_format, char_format)
+            cursor.insertText(message_content)
+        if (
+            not is_user_message
+            and not is_ai_message
+            and not is_system_message
+            and not is_processing
+        ):
+            cursor.insertBlock(block_format, char_format)
+            cursor.insertText(message_content)
+
+        self.responseArea.ensureCursorVisible()
+
+    def _process_response_queue(self):
+        """AppController의 응답 큐를 처리하여 GUI 업데이트"""
         try:
-            while True:
-                message_data = self.response_queue.get_nowait()
-                print(f"GUI Queue Received: {message_data}")
+            while not self.app_controller.response_queue.empty():
+                message = self.app_controller.response_queue.get_nowait()
+                print(f"[DEBUG] Processing queue message: '{message}'")
 
-                if isinstance(message_data, tuple) and len(message_data) >= 1:
-                    message_type = message_data[0]
-                    payload = message_data[1] if len(message_data) > 1 else None
+                if message.startswith("User"):
+                    print(f"[DEBUG] Ignoring User message from queue: '{message}'")
+                    continue
 
-                    if message_type == "display":
-                        self._display_response(payload)
-                    elif message_type == "status":
-                        is_thinking = (
-                            message_data[2] if len(message_data) > 2 else False
+                elif message.startswith("AI\n"):
+                    ai_msg = message[len("AI\n") :]
+                    self._append_message(f"Agent:\n{ai_msg}")
+                elif message.startswith("System:"):
+                    system_msg = message[len("System: ") :]
+                    if system_msg == "AI 처리 중...":
+                        print(
+                            "[DEBUG] Ignoring 'System: AI 처리 중...' message from queue."
                         )
-                        self.update_status(payload, is_thinking)
-                    elif message_type == "recording_status":
-                        self.update_recording_status(payload)
-                    elif message_type == "update_attachments":
-                        self._update_attachment_list()
-                    elif message_type == "clear_chat":
-                        self.clear_chat_display()
-                    elif message_type == "clear_attachments":
-                        self.clear_attachment_list()
-                    elif message_type == "set_input":
-                        self.set_input_text(payload)
-                    elif message_type == "enable_buttons":
-                        self._enable_buttons()
-                    elif message_type == "disable_buttons":
-                        self._disable_buttons()
-                    elif message_type == "new_chat_started":
-                        self.clear_chat_display()
-                        self.clear_attachment_list()
-                        self._display_response(
-                            "System: 새로운 채팅 세션이 시작되었습니다."
+                        continue
+                    elif system_msg == "Buttons enabled":
+                        self._enable_ui_elements()
+                    elif system_msg == "Buttons disabled":
+                        self._disable_ui_elements()
+                    elif system_msg == "Clear chat display":
+                        self.responseArea.clear()
+                    elif system_msg == "Clear attachment label":
+                        self.attachmentListWidget.clear()
+                        self.attachmentListWidget.setVisible(False)
+                    elif system_msg == "Show recording status":
+                        print("[UI HINT] Show recording status indicator")
+                        self._append_message("<i>음성 녹음 중...</i>")
+                    elif system_msg == "Hide recording status":
+                        print("[UI HINT] Hide recording status indicator")
+                    else:
+                        color = (
+                            "orange"
+                            if "경고" in system_msg
+                            else "red" if "오류" in system_msg else "#AAAAAA"
                         )
-                        self.update_status("대기 중")
-                        self._enable_buttons()
+                        self._append_message(
+                            f"<font color='{color}'><i>{system_msg}</i></font>"
+                        )
+                else:
+                    print(f"[DEBUG] Unknown message format in queue: '{message}'")
+                    if "⏳ AI 처리 중..." not in message:
+                        print(f"[DEBUG] Appending unknown message: '{message}'")
+                        self._append_message(
+                            f"<font color='gray'><i>알 수 없는 시스템 메시지: {message}</i></font>"
+                        )
                     else:
                         print(
-                            f"GUI Warning: Unknown message type from queue: {message_type}"
+                            f"[DEBUG] Skipped displaying unknown message containing processing indicator: '{message}'"
                         )
-                elif isinstance(message_data, str):
-                    if message_data == "System: Buttons enabled":
-                        self._enable_buttons()
-                    elif message_data == "System: Hide recording status":
-                        self.update_recording_status(False)
-                    elif message_data == "System: Clear attachment label":
-                        self.clear_attachment_list()
-                    elif message_data == "System: 새 채팅 시작됨.":
-                        self.clear_chat_display()
-                        self.clear_attachment_list()
-                        self._display_response(
-                            "System: 새로운 채팅 세션이 시작되었습니다."
-                        )
-                        self.update_status("대기 중")
-                        self._enable_buttons()
-                    elif message_data.startswith("System: Set input text|"):
-                        text_to_set = message_data.split("|", 1)[1]
-                        self.set_input_text(text_to_set)
-                    elif not message_data.startswith("System:"):
-                        self._display_response(message_data)
-                else:
-                    print(
-                        f"GUI Warning: Received invalid message format from queue: {message_data}"
-                    )
 
         except queue.Empty:
             pass
         except Exception as e:
-            print(f"GUI Error: _check_queue 중 오류 발생: {e}")
+            print(f"[DEBUG] Error processing response queue: {e}")
             traceback.print_exc()
-
-    def _disable_buttons(self):
-        """입력 관련 버튼 비활성화"""
-        if self.send_button:
-            self.send_button.setEnabled(False)
-        if self.stt_button:
-            self.stt_button.setEnabled(False)
-        if self.new_chat_button:
-            self.new_chat_button.setEnabled(False)
-        if self.attach_button:
-            self.attach_button.setEnabled(False)
-        if self.request_entry:
-            self.request_entry.setReadOnly(True)
-
-    def _enable_buttons(self):
-        """입력 관련 버튼 활성화"""
-        if self.send_button:
-            self.send_button.setEnabled(True)
-        if self.stt_button:
-            self.stt_button.setEnabled(True)
-        if self.new_chat_button:
-            self.new_chat_button.setEnabled(True)
-        if self.attach_button:
-            self.attach_button.setEnabled(True)
-        if self.request_entry:
-            self.request_entry.setReadOnly(False)
-        if self.request_entry:
-            self.request_entry.setFocus()
-
-    def _display_response(self, text: str):
-        """답변 영역에 텍스트 표시 (HTML 형식 개선)"""
-        if not self.response_area or not isinstance(text, str):
-            return
-
-        cursor = self.response_area.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.response_area.setTextCursor(cursor)
-
-        html_text = ""
-        if text.startswith("User\n"):
-            content = text.split("\n", 1)[1].replace("\n", "<br>")
-            html_text = f"<p><b>User:</b><br>{content}</p>"
-        elif text.startswith("AI\n"):
-            content = text.split("\n", 1)[1].replace("\n", "<br>")
-            html_text = f'<p style="color: #2980b9;"><b>AI:</b><br>{content}</p>'
-        elif text.startswith("System:"):
-            html_text = f"<p><i>{text.replace("\n", "<br>")}</i></p>"
-        else:
-            html_text = f"<p>{text.replace("\n", "<br>")}</p>"
-
-        self.response_area.insertHtml(html_text + "<br>")
-        self.response_area.ensureCursorVisible()
-
-    def update_status(self, status_text: str, is_thinking: bool = False):
-        """상태 레이블 업데이트 및 시각적 피드백"""
-        if self.status_label:
-            self.status_label.setText(status_text)
-            self.status_label.setProperty("thinking", is_thinking)
-            self.status_label.style().unpolish(self.status_label)
-            self.status_label.style().polish(self.status_label)
-
-            if is_thinking:
-                pass
-            else:
-                pass
-
-    def update_recording_status(self, is_recording: bool):
-        """녹음 상태 레이블 및 시각적 표시 업데이트"""
-        if self.recording_status_label:
-            if is_recording:
-                self.recording_status_label.setText("🔴 녹음 중...")
-                self.recording_status_label.show()
-            else:
-                self.recording_status_label.hide()
-
-    def clear_chat_display(self):
-        """채팅 출력 영역 초기화"""
-        if self.response_area:
-            self.response_area.clear()
-
-    def clear_attachment_list(self):
-        """첨부 파일 목록 위젯 초기화 및 숨김"""
-        print("GUI DEBUG: clear_attachment_list() 호출됨")
-        if self.attachment_list_widget:
-            self.attachment_list_widget.clear()
-        if self.attachment_frame:
-            self.attachment_frame.hide()
-            print("GUI DEBUG: Attachment frame hidden.")
-
-    def _update_attachment_list(self):
-        """첨부 파일 목록 위젯을 업데이트하고 표시/숨김 처리"""
-        print("GUI DEBUG: _update_attachment_list() 시작")
-
-        widget_exists = hasattr(self, "attachment_list_widget")
-        frame_exists = hasattr(self, "attachment_frame")
-        print(
-            f"GUI DEBUG: Checking attributes - widget_exists: {widget_exists}, frame_exists: {frame_exists}"
-        )
-        widget_val = None
-        frame_val = None
-        if widget_exists:
-            widget_val = self.attachment_list_widget
-            print(f"GUI DEBUG: self.attachment_list_widget value: {widget_val}")
-        if frame_exists:
-            frame_val = self.attachment_frame
-            print(f"GUI DEBUG: self.attachment_frame value: {frame_val}")
-
-        widget = widget_val
-        frame = frame_val
-
-        if widget is None:
-            print(f"GUI DEBUG: Condition 'widget is None' is True. Returning.")
-            return
-        if frame is None:
-            print(f"GUI DEBUG: Condition 'frame is None' is True. Returning.")
-            return
-
-        print(
-            f"GUI DEBUG: Both widget ({widget}) and frame ({frame}) are valid. Proceeding."
-        )
-
-        widget.clear()
-        try:
-            file_paths = self.controller.get_attachment_paths()
-            filenames = [os.path.basename(p) for p in file_paths]
-            print(f"GUI DEBUG: Fetched {len(filenames)} attachments: {filenames}")
-        except Exception as e:
-            print(f"GUI ERROR: 컨트롤러에서 첨부 파일 목록 가져오기 실패: {e}")
-            filenames = []
-
-        if filenames:
-            print("GUI DEBUG: 첨부 파일 있음, 목록 업데이트 및 프레임 표시 시도...")
-            for i, name in enumerate(filenames):
-                item = QListWidgetItem(name)
-                item.setToolTip(file_paths[i])
-                widget.addItem(item)
-            frame.show()
-            print(
-                f"GUI DEBUG: Attachment frame.show() 호출됨. frame.isVisible(): {frame.isVisible()}"
-            )
-            widget.scrollToBottom()
-        else:
-            print("GUI DEBUG: 첨부 파일 없음, 프레임 숨김 시도...")
-            frame.hide()
-            print(
-                f"GUI DEBUG: Attachment frame.hide() 호출됨. frame.isVisible(): {frame.isVisible()}"
+            self._append_message(
+                f"<font color='red'>오류: 응답 처리 중 문제 발생 - {e}</font>"
             )
 
-    def set_input_text(self, text: str):
-        """입력 필드에 텍스트 설정"""
-        if self.request_entry:
-            self.request_entry.setPlainText(text)
-            self.request_entry.moveCursor(QTextCursor.MoveOperation.End)
+    def _attach_file(self):
+        """파일 첨부 대화상자 열기"""
+        print("[DEBUG] _attach_file called")
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "파일 첨부", "", "모든 파일 (*.*)"
+        )
+        if file_paths:
+            print(f"[DEBUG] Files selected: {file_paths}")
+            for file_path in file_paths:
+                if file_path not in self.attached_files:
+                    if self.app_controller.attach_file(file_path):
+                        item = QListWidgetItem(os.path.basename(file_path))
+                        item.setData(Qt.ItemDataRole.UserRole, file_path)
+                        item.setToolTip(file_path)
+                        self.attachmentListWidget.addItem(item)
+                    else:
+                        print(f"[DEBUG] File not added by AppController: {file_path}")
+            if self.attachmentListWidget.count() > 0:
+                self.attachmentListWidget.setVisible(True)
+                QApplication.processEvents()
+                print(
+                    f"[DEBUG] _attach_file: attachmentListWidget visibility after setVisible(True): {self.attachmentListWidget.isVisible()}"
+                )
+                print(
+                    f"[DEBUG] _attach_file: attachmentListWidget size: {self.attachmentListWidget.size()}"
+                )
 
-    @pyqtSlot(QListWidgetItem)
-    def _handle_attachment_double_click(self, item: QListWidgetItem):
-        """첨부 파일 목록 항목 더블 클릭 시 처리 (예: 경로 복사)"""
-        filepath = item.toolTip()
-        if filepath:
-            clipboard = QGuiApplication.clipboard()
-            clipboard.setText(filepath)
-            self.update_status(f"경로 복사됨: {os.path.basename(filepath)}")
-            QTimer.singleShot(2000, lambda: self.update_status("대기 중"))
-            print(f"GUI: Copied attachment path to clipboard: {filepath}")
+    def _handle_pasted_files(self, file_paths):
+        """붙여넣기된 파일 처리"""
+        print(f"[DEBUG] _handle_pasted_files called with: {file_paths}")
+        if file_paths:
+            for file_path in file_paths:
+                if file_path not in self.attached_files:
+                    if self.app_controller.attach_file(file_path):
+                        item = QListWidgetItem(os.path.basename(file_path))
+                        item.setData(Qt.ItemDataRole.UserRole, file_path)
+                        item.setToolTip(file_path)
+                        self.attachmentListWidget.addItem(item)
+                        print(f"[DEBUG] File attached via paste: {file_path}")
+                    else:
+                        print(
+                            f"[DEBUG] File not added by AppController (paste): {file_path}"
+                        )
+            if self.attachmentListWidget.count() > 0:
+                self.attachmentListWidget.setVisible(True)
+                QApplication.processEvents()
+                print(
+                    f"[DEBUG] _handle_pasted_files: attachmentListWidget visibility after setVisible(True): {self.attachmentListWidget.isVisible()}"
+                )
+                print(
+                    f"[DEBUG] _handle_pasted_files: attachmentListWidget size: {self.attachmentListWidget.size()}"
+                )
 
-    @pyqtSlot(QUrl)
-    def _handle_anchor_clicked(self, url: QUrl):
-        """response_area의 링크 클릭 시 처리"""
-        print(f"GUI: Link clicked: {url.toString()}")
-        QDesktopServices.openUrl(url)
+    def _remove_attachment(self, item):
+        """첨부 파일 목록에서 항목 제거"""
+        file_path_to_remove = item.data(Qt.ItemDataRole.UserRole)
+        print(f"[DEBUG] _remove_attachment called for: {file_path_to_remove}")
+        row = self.attachmentListWidget.row(item)
+        self.attachmentListWidget.takeItem(row)
+        if self.app_controller:
+            self.app_controller.remove_attachment(file_path_to_remove)
+        else:
+            print("[DEBUG] Error: AppController not available to remove attachment.")
+
+        if self.attachmentListWidget.count() == 0:
+            self.attachmentListWidget.setVisible(False)
+
+    def _start_stt(self):
+        """음성-텍스트 변환 시작 (AppController 호출)"""
+        print("[DEBUG] _start_stt called")
+
+        if self.app_controller:
+            print("[DEBUG] Calling app_controller.handle_voice_input()")
+            self.app_controller.handle_voice_input()
+        else:
+            print("[DEBUG] Error: AppController not available for STT.")
+            self._append_message(
+                "<font color='red'>오류: AppController가 연결되지 않아 음성 입력을 시작할 수 없습니다.</font>"
+            )
+
+    def _start_new_chat(self):
+        """새로운 대화 시작 (AppController 호출)"""
+        print("[DEBUG] _start_new_chat called")
+        if self.app_controller:
+            self.app_controller.start_new_chat_session()
+        else:
+            print("[DEBUG] Error: AppController not available to start new chat.")
+            self._append_message(
+                "<font color='red'>오류: AppController가 연결되지 않아 새 대화를 시작할 수 없습니다.</font>"
+            )
 
     def closeEvent(self, event):
         """창 닫기 이벤트 처리"""
-        reply = QMessageBox.question(
-            self,
-            "종료 확인",
-            "애플리케이션을 종료하시겠습니까?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-            print("GUI: 종료 요청됨. main 루프 중지 예정...")
-            if self.hotkey_manager:
-                print("GUI: HotkeyManager 리스너 중지 시도...")
-                self.hotkey_manager.stop_listener()
-            self.controller.request_shutdown()
-            event.accept()
-        else:
-            event.ignore()
-
-    def bring_to_front(self):
-        """애플리케이션 창을 맨 앞으로 가져오고 활성화합니다."""
-        if self.isMinimized():
-            self.showNormal()
-        self.raise_()
-        self.activateWindow()
-        print("GUI: 창을 앞으로 가져왔습니다.")
-
-    def run(self):
-        """GUI 표시 (main.py에서 호출될 것으로 예상)"""
-        self.show()
+        print("[DEBUG] closeEvent called")
+        event.accept()

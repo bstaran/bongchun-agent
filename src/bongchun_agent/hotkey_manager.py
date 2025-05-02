@@ -30,13 +30,17 @@ class HotkeyManager(QObject):
 
     def _internal_activate_callback(self):
         """음성 입력 활성화 단축키가 눌렸을 때 시그널 발생"""
+        print("[HotkeyManager DEBUG] _internal_activate_callback 호출됨")
         print("음성 입력 활성화 단축키 감지됨!")
         self.activate_signal.emit()
+        print("[HotkeyManager DEBUG] activate_signal emit 완료")
 
     def _internal_show_window_callback(self):
         """앱 창 표시 단축키가 눌렸을 때 시그널 발생"""
+        print("[HotkeyManager DEBUG] _internal_show_window_callback 호출됨")
         print("앱 창 표시 단축키 감지됨!")
         self.show_window_signal.emit()
+        print("[HotkeyManager DEBUG] show_window_signal emit 완료")
 
     def register_hotkeys(self, activate=True, show_window=True, paste=True):
         """
